@@ -569,6 +569,82 @@ fn getLatestReleaseGithub(scratch: *Scratch, client: *std.http.Client, owner_rep
         .tarball_url = allocUrlGithubTarball(scratch.allocator(), owner_repo, tag_name),
     } };
 }
+fn getLatestReleaseCodeberg(scratch: *Scratch, client: *std.http.Client, owner_repo: *const OwnerRepo) GitArchive {
+    log.info("fetching latest release for codeberg:{s}...", .{owner_repo.string});
+    const release_url = std.fmt.allocPrint(
+        scratch.allocator(),
+        "https://codeberg.org/api/v1/repos/{s}/releases/latest",
+        .{owner_repo.string},
+    ) catch |e| oom(e);
+    defer scratch.allocator().free(release_url);
+    var timer = timerStart();
+    var fetch_result = fetchGitJson(release_url, client, scratch.allocator());
+    errdefer fetch_result.body.deinit(scratch.allocator());
+    if (fetch_result.status == .ok) {
+        const elapsed: f64 = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_s;
+        log.info("fetched latest release JSON in {d:.2} seconds", .{elapsed});
+        const release = blk_release: {
+            var err: ParseJsonError = undefined;
+            break :blk_release parseReleaseCodeberg(
+                fetch_result.body.items,
+                &err,
+            ) catch jsonErrorExit(scratch, release_url, fetch_result.body.items, &err);
+        };
+        log.info("latest release is tag {s}", .{release.tag_name});
+        return .{ .rev = .{
+            .json = fetch_result.body,
+            .rev_name = release.tag_name,
+            .tarball_url = release.tarball_url,
+        } };
+    }
+    {
+        // Only fall back to tags if the releases endpoint returned "Not Found".
+        // Other 404s (e.g. repo doesn't exist) should still be fatal.
+        const is_no_releases = fetch_result.status == .not_found and blk_msg: {
+            var err: ParseJsonError = undefined;
+            const msg = parseMessage(fetch_result.body.items, &err) catch
+                jsonErrorExit(scratch, release_url, fetch_result.body.items, &err);
+            break :blk_msg std.mem.eql(u8, msg, "Not Found");
+        };
+        if (!is_no_releases)
+            fetchErrExit(release_url, fetch_result);
+    }
+    fetch_result.body.deinit(scratch.allocator());
+
+    // No releases found, fall back to latest tag.
+    log.info("no releases found, fetching latest tag for codberg:{s}...", .{owner_repo.string});
+    const tags_url = std.fmt.allocPrint(
+        scratch.allocator(),
+        "https://codeberg.org/api/v1/repos/{s}/tags?page=1",
+        .{owner_repo.string},
+    ) catch |e| oom(e);
+    defer scratch.allocator().free(tags_url);
+    timer = timerStart();
+    var tags_result = fetchGitJson(tags_url, client, scratch.allocator());
+    errdefer tags_result.body.deinit(scratch.allocator());
+    if (tags_result.status != .ok)
+        fetchErrExit(tags_url, tags_result);
+    const tags_elapsed: f64 = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_s;
+    log.info("fetched latest tag JSON in {d:.2} seconds", .{tags_elapsed});
+    const tag_name = blk_tag: {
+        var err: ParseJsonError = undefined;
+        break :blk_tag (parseLatestTagCodeberg(tags_result.body.items, &err) catch |e| switch (e) {
+            error.ParseJson => jsonErrorExit(scratch, tags_url, tags_result.body.items, &err),
+        }) orelse {
+            log.info("no tags found either, falling back to tip for codeberg:{s}...", .{owner_repo.string});
+            tags_result.body.deinit(scratch.allocator());
+            const tip_archive = fetchTipCodeberg(scratch, scratch.allocator(), owner_repo, client);
+            log.info("tip is commit {f}", .{&tip_archive.tip.sha});
+            return tip_archive;
+        };
+    };
+    log.info("latest tag is {s}", .{tag_name});
+    return .{ .rev = .{
+        .json = tags_result.body,
+        .rev_name = tag_name,
+        .tarball_url = allocUrlCodebergTarball(scratch.allocator(), owner_repo, tag_name),
+    } };
+}
 
 fn allocUrlGithubTarball(allocator: std.mem.Allocator, owner_repo: *const OwnerRepo, tag_name: []const u8) []u8 {
     return std.fmt.allocPrint(
@@ -582,6 +658,13 @@ fn allocUrlGitlabTarball(allocator: std.mem.Allocator, owner_repo: *const OwnerR
         allocator,
         "https://gitlab.com/api/v4/projects/{f}/repository/archive.tar.gz?sha={s}",
         .{ fmtGitlabProjectId(owner_repo), sha },
+    ) catch |e| oom(e);
+}
+fn allocUrlCodebergTarball(allocator: std.mem.Allocator, owner_repo: *const OwnerRepo, tag_name: []const u8) []u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "https://codeberg.org/api/v1/repos/{s}/archive/{s}.tar.gz",
+        .{ owner_repo.string, tag_name },
     ) catch |e| oom(e);
 }
 
@@ -737,6 +820,36 @@ fn fetchTipGitlab(scratch: *Scratch, allocator: std.mem.Allocator, owner_repo: *
         .tarball_url = tarball_url,
     } };
 }
+fn fetchTipCodeberg(scratch: *Scratch, allocator: std.mem.Allocator, owner_repo: *const OwnerRepo, client: *std.http.Client) GitArchive {
+    log.info("fetching tip commit for codeberg:{s}...", .{owner_repo.string});
+    const commit_url = std.fmt.allocPrint(
+        scratch.allocator(),
+        "https://codeberg.org/api/v1/repos/{s}/commits/HEAD/status",
+        .{owner_repo.string},
+    ) catch |e| oom(e);
+    defer scratch.allocator().free(commit_url);
+    var timer = timerStart();
+    const commit_result = fetchGitJson(commit_url, client, allocator);
+    if (commit_result.status != .ok)
+        fetchErrExit(commit_url, commit_result);
+    const elapsed: f64 = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_s;
+    log.info("fetched tip commit JSON in {d:.2} seconds", .{elapsed});
+    const sha = blk: {
+        var err: ParseJsonError = undefined;
+        break :blk parseCommitShaCodeberg(
+            commit_result.body.items,
+            &err,
+        ) catch jsonErrorExit(scratch, commit_url, commit_result.body.items, &err);
+    };
+    const sha_hex = sha.hex();
+    const tarball_url = allocUrlCodebergTarball(allocator, owner_repo, &sha_hex);
+    errdefer allocator.free(tarball_url);
+    return .{ .tip = .{
+        .json = commit_result.body,
+        .sha = sha,
+        .tarball_url = tarball_url,
+    } };
+}
 
 fn installPkgGit(scratch: *Scratch, config: *const InstallConfig, pkg: PkgGit) !void {
     const scratch_pos = scratch.position();
@@ -748,6 +861,7 @@ fn installPkgGit(scratch: *Scratch, config: *const InstallConfig, pkg: PkgGit) !
         .latest_release => switch (pkg.host) {
             .github => getLatestReleaseGithub(scratch, &client, &pkg.owner_repo),
             .gitlab => getLatestReleaseGitlab(scratch, &client, &pkg.owner_repo),
+            .codeberg => getLatestReleaseCodeberg(scratch, &client, &pkg.owner_repo),
         },
         .rev => |rev| break :blk .{ .rev = .{
             .json = .{},
@@ -755,6 +869,7 @@ fn installPkgGit(scratch: *Scratch, config: *const InstallConfig, pkg: PkgGit) !
             .tarball_url = switch (pkg.host) {
                 .github => allocUrlGithubTarball(scratch.allocator(), &pkg.owner_repo, rev),
                 .gitlab => allocUrlGitlabTarball(scratch.allocator(), &pkg.owner_repo, rev),
+                .codeberg => allocUrlCodebergTarball(scratch.allocator(), &pkg.owner_repo, rev),
             },
         } },
         .tip => break :blk switch (pkg.host) {
@@ -765,6 +880,12 @@ fn installPkgGit(scratch: *Scratch, config: *const InstallConfig, pkg: PkgGit) !
                 &client,
             ),
             .gitlab => fetchTipGitlab(
+                scratch,
+                scratch.allocator(),
+                &pkg.owner_repo,
+                &client,
+            ),
+            .codeberg => fetchTipCodeberg(
                 scratch,
                 scratch.allocator(),
                 &pkg.owner_repo,
@@ -1594,6 +1715,31 @@ fn gitAuthHeader(buf: *[github_auth_buf_len]u8, url: []const u8) std.http.Client
             @memcpy(buf[0..bearer_prefix.len], bearer_prefix);
             return .{ .override = buf[0 .. bearer_prefix.len + token_len] };
         },
+        .codeberg => {
+            const dest = buf[bearer_prefix.len..];
+            const token_len, const env_name = if (builtin.os.tag == .windows) blk: {
+                if (getEnvWindows(L("CB_TOKEN"), dest)) |len| break :blk .{ len, "CB_TOKEN" };
+                if (getEnvWindows(L("CODEBERG_TOKEN"), dest)) |len| break :blk .{ len, "CODEBERG_TOKEN" };
+                break :blk .{ @as(usize, 0), @as([]const u8, "none") };
+            } else blk: {
+                if (std.posix.getenv("CB_TOKEN")) |token| {
+                    if (token.len > dest.len) errExit("CB_TOKEN too long", .{});
+                    @memcpy(dest[0..token.len], token);
+                    break :blk .{ token.len, "CB_TOKEN" };
+                }
+                if (std.posix.getenv("CODEBERG_TOKEN")) |token| {
+                    if (token.len > dest.len) errExit("CODEBERG_TOKEN too long", .{});
+                    @memcpy(dest[0..token.len], token);
+                    break :blk .{ token.len, "CODEBERG_TOKEN" };
+                }
+                break :blk .{ @as(usize, 0), @as([]const u8, "none") };
+            };
+            if (!github_auth_logged.swap(true, .monotonic))
+                log.info("codeberg auth: {s}", .{env_name});
+            if (token_len == 0) return .default;
+            @memcpy(buf[0..bearer_prefix.len], bearer_prefix);
+            return .{ .override = buf[0 .. bearer_prefix.len + token_len] };
+        },
     }
 }
 
@@ -1900,6 +2046,7 @@ fn parseLatestTagGithub(text: []const u8, err: *ParseJsonError) error{ParseJson}
 
 // at least for now, we can use the same logic to extract the tag name as github
 const parseLatestTagGitlab = parseLatestTagGithub;
+const parseLatestTagCodeberg = parseLatestTagGithub;
 
 fn parseReleaseGithub(text: []const u8, err: *ParseJsonError) error{ParseJson}!Release {
     var index = try parseJsonObjectStart(err, text, 0);
@@ -1972,12 +2119,16 @@ fn parseReleaseGitlab(text: []const u8, err: *ParseJsonError) error{ParseJson}!R
     };
 }
 
+const parseReleaseCodeberg = parseReleaseGithub;
+
 fn parseCommitShaGithub(text: []const u8, err: *ParseJsonError) error{ParseJson}!GitSha {
     return parseSha(text, err, "sha");
 }
 fn parseCommitShaGitlab(text: []const u8, err: *ParseJsonError) error{ParseJson}!GitSha {
     return parseSha(text, err, "id");
 }
+const parseCommitShaCodeberg = parseCommitShaGithub;
+
 fn parseSha(text: []const u8, err: *ParseJsonError, field_name: [:0]const u8) error{ParseJson}!GitSha {
     var index = try parseJsonObjectStart(err, text, 0);
     var first_field: bool = true;
