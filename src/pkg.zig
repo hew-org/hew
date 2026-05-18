@@ -28,6 +28,7 @@ pub const Pkg = union(enum) {
         const maybe_git_host: ?GitHost = blk: {
             if (std.mem.eql(u8, scheme, "github")) break :blk .github;
             if (std.mem.eql(u8, scheme, "gitlab")) break :blk .gitlab;
+            if (std.mem.eql(u8, scheme, "codeberg")) break :blk .codeberg;
             break :blk null;
         };
 
@@ -75,7 +76,7 @@ pub const Pkg = union(enum) {
     }
 };
 
-pub const GitHost = enum { github, gitlab };
+pub const GitHost = enum { github, gitlab, codeberg };
 
 pub const OwnerRepo = struct {
     string: []const u8,
