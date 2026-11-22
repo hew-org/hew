@@ -256,7 +256,7 @@ fn installPkg(scratch: *Scratch, config: *const InstallConfig, pkg: Pkg) !void {
     }
 }
 
-const anyzig_version: *const [11]u8 = "v2025_10_15";
+const anyzig_version: *const [11]u8 = "v2026_11_12";
 
 fn allocAnyzigPath(allocator: std.mem.Allocator, app_data_path: []const u8, version: *const [11]u8) error{OutOfMemory}![]u8 {
     const ext = if (builtin.os.tag == .windows) ".exe" else "";
