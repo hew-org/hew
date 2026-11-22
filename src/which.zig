@@ -1,4 +1,6 @@
 pub const Iterator = struct {
+    io: std.Io,
+    environ: std.process.Environ,
     path_buf: []u8,
     path_env: if (builtin.os.tag == .windows) [:0]const u16 else []const u8,
     pos: usize = 0,
@@ -6,13 +8,15 @@ pub const Iterator = struct {
     const sep: u8 = if (builtin.os.tag == .windows) '\\' else '/';
     const extensions = [_][]const u8{ ".exe", ".cmd", ".bat", ".com" };
 
-    pub fn fromEnv(path_buf: []u8) Iterator {
-        return if (builtin.os.tag == .windows) .{
+    pub fn fromEnv(io: std.Io, environ: std.process.Environ, path_buf: []u8) Iterator {
+        return .{
+            .io = io,
+            .environ = environ,
             .path_buf = path_buf,
-            .path_env = std.process.getenvW(std.unicode.utf8ToUtf16LeStringLiteral("PATH")) orelse &.{},
-        } else .{
-            .path_buf = path_buf,
-            .path_env = std.posix.getenv("PATH") orelse "",
+            .path_env = if (builtin.os.tag == .windows)
+                environ.getWindows(std.unicode.wtf8ToWtf16LeStringLiteral("PATH")) orelse &.{}
+            else
+                environ.getPosix("PATH") orelse "",
         };
     }
 
@@ -27,7 +31,7 @@ pub const Iterator = struct {
                 var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
                 const dir_len = std.unicode.wtf16LeToWtf8(&dir_buf, dir_w);
                 const dir = dir_buf[0..dir_len];
-                const expanded_len = pathenv.expandLen(dir);
+                const expanded_len = pathenv.expandLen(it.environ, dir);
                 if (!hasExt(name)) {
                     for (extensions) |ext| {
                         if (try it.checkPath(dir, expanded_len, name, ext)) |result| return result;
@@ -43,7 +47,7 @@ pub const Iterator = struct {
                 it.pos = end + 1;
                 const dir = it.path_env[start..end];
                 if (dir.len == 0) continue;
-                const expanded_len = pathenv.expandLen(dir);
+                const expanded_len = pathenv.expandLen(it.environ, dir);
                 if (try it.checkPath(dir, expanded_len, name, "")) |result| return result;
             }
         }
@@ -62,7 +66,7 @@ pub const Iterator = struct {
             std.log.warn("path too long for buffer: {s}{c}{s}{s}", .{ dir, sep, name, ext });
             return null;
         }
-        pathenv.expandInto(dir, it.path_buf[0..expanded_len]);
+        pathenv.expandInto(it.environ, dir, it.path_buf[0..expanded_len]);
         var pos = expanded_len;
 
         if (pos > 0 and it.path_buf[pos - 1] != '/' and it.path_buf[pos - 1] != sep) {
@@ -77,7 +81,7 @@ pub const Iterator = struct {
         it.path_buf[pos] = 0;
 
         const path = it.path_buf[0..pos :0];
-        std.fs.cwd().access(path, .{}) catch |err| switch (err) {
+        std.Io.Dir.cwd().access(it.io, path, .{}) catch |err| switch (err) {
             error.FileNotFound,
             error.AccessDenied,
             error.PermissionDenied,
