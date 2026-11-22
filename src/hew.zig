@@ -1,6 +1,6 @@
-fn usage() !void {
+fn usage(io: std.Io) !void {
     var stderr_buf: [1000]u8 = undefined;
-    var stderr = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr = std.Io.File.stderr().writer(io, &stderr_buf);
     stderr.interface.print(
         \\Usage: hew COMMAND [OPTIONS] ARGS...
         \\Version: {[version]s}
@@ -24,27 +24,62 @@ fn usage() !void {
     stderr.interface.flush() catch return stderr.err.?;
 }
 
-pub fn main() !u8 {
+/// Process-wide resources and settings derived from the environment at startup.
+const ProcessEnv = struct {
+    io: std.Io,
+    environ: std.process.Environ,
+    /// The directory for temporary files, with no trailing separator.
+    tmp_dir: []const u8,
+};
+
+// On windows wintrace reports panics, unhandled exceptions and errors returned
+// from main as small traces that need no debug info at run time.
+pub const panic = if (builtin.os.tag == .windows) wintrace.panic else std.debug.FullPanic(std.debug.defaultPanic);
+pub const wintrace_options: wintrace.Options = .{ .mode = .small };
+
+pub fn main(init: std.process.Init.Minimal) !u8 {
+    if (builtin.os.tag == .windows) {
+        if (wintrace.SetUnhandledExceptionFilter(&wintrace.unhandledExceptionFilter) != null) unreachable;
+        var guarantee: u32 = wintrace.stack_guarantee;
+        if (wintrace.SetThreadStackGuarantee(&guarantee) == 0) std.debug.panic(
+            "SetThreadStackGuarantee failed, error={d}",
+            .{@backingInt(std.os.windows.GetLastError())},
+        );
+    }
+    return run(init) catch |err| {
+        if (builtin.os.tag == .windows) wintrace.exitWithErrorTrace(err, @errorReturnTrace());
+        return err;
+    };
+}
+
+fn run(init: std.process.Init.Minimal) !u8 {
+    // Not global_single_threaded: its failing allocator can't spawn processes on
+    // windows and its environment is empty on posix (used to spawn processes).
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{ .environ = init.environ });
+    const io = threaded.io();
     var arena_instance = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     const arena = arena_instance.allocator();
 
-    var arg_it = switch (builtin.os.tag) {
-        .windows => try std.process.argsWithAllocator(arena),
-        else => std.process.args(),
+    const ctx: ProcessEnv = .{
+        .io = io,
+        .environ = init.environ,
+        .tmp_dir = allocTmpDir(arena, init.environ),
     };
+
+    var arg_it = try init.args.iterateAllocator(arena);
     _ = arg_it.next();
     const cmd = blk: {
         while (arg_it.next()) |arg| {
             if (!std.mem.startsWith(u8, arg, "-")) break :blk arg;
             errExit("unknown option '{s}'", .{arg});
         }
-        try usage();
+        try usage(io);
         return 0xff;
     };
-    if (std.mem.eql(u8, cmd, "install") or std.mem.eql(u8, cmd, "i")) return try install(arena, &arg_it);
-    if (std.mem.eql(u8, cmd, "new-bin-path")) return try setBinPath(arena, &arg_it, .require_new);
+    if (std.mem.eql(u8, cmd, "install") or std.mem.eql(u8, cmd, "i")) return try install(arena, &ctx, &arg_it);
+    if (std.mem.eql(u8, cmd, "new-bin-path")) return try setBinPath(arena, &ctx, &arg_it, .require_new);
     if (std.mem.eql(u8, cmd, "version")) {
-        var writer = std.fs.File.stdout().writer(&.{});
+        var writer = std.Io.File.stdout().writer(io, &.{});
         writer.interface.writeAll(@embedFile("version") ++ "\n") catch return writer.err.?;
         return 0;
     }
@@ -52,7 +87,7 @@ pub fn main() !u8 {
     return 0xff;
 }
 
-fn install(arena: std.mem.Allocator, arg_it: *std.process.ArgIterator) !u8 {
+fn install(arena: std.mem.Allocator, ctx: *const ProcessEnv, arg_it: *std.process.Args.Iterator) !u8 {
     const Config = struct {
         pkgs: []const Pkg,
         interactive: bool,
@@ -62,7 +97,7 @@ fn install(arena: std.mem.Allocator, arg_it: *std.process.ArgIterator) !u8 {
         maybe_app_data: ?[:0]const u8,
     };
     const config: Config = blk_config: {
-        var pkgs: std.ArrayListUnmanaged(Pkg) = .{};
+        var pkgs: std.ArrayList(Pkg) = .empty;
         var interactive: bool = true;
         var keep_archives: bool = false;
         var allow_overwrite: bool = false;
@@ -102,17 +137,20 @@ fn install(arena: std.mem.Allocator, arg_it: *std.process.ArgIterator) !u8 {
 
     if (config.pkgs.len == 0) errExit("no packages given to install", .{});
 
-    const app_data_path = config.maybe_app_data orelse allocAppDataPath(arena);
+    const app_data_path = config.maybe_app_data orelse allocAppDataPath(arena, ctx.environ);
     std.debug.assert(std.fs.path.isAbsolute(app_data_path));
     var scratch: Scratch = .init(std.heap.page_allocator);
+    var git_auth: GitAuth = .init(ctx.environ);
     const install_config: InstallConfig = .{
+        .ctx = ctx,
+        .git_auth = &git_auth,
         .interactive = config.interactive,
         .keep_archives = config.keep_archives,
         .allow_overwrite = config.allow_overwrite,
         .allow_shadow = config.allow_shadow,
         .app_data_path = app_data_path,
-        .cache_path = allocCachePath(arena, app_data_path),
-        .bin_path = try allocBinPath(arena, &scratch, config.interactive, app_data_path),
+        .cache_path = allocCachePath(arena, ctx.environ, app_data_path),
+        .bin_path = try allocBinPath(arena, ctx, &scratch, config.interactive, app_data_path),
     };
     std.debug.assert(std.fs.path.isAbsolute(install_config.cache_path));
     std.debug.assert(std.fs.path.isAbsolute(install_config.bin_path));
@@ -156,7 +194,7 @@ fn isBinPathNormalized(path: []const u8) bool {
 
 fn normalizeBinPath(arena: std.mem.Allocator, path: [:0]const u8) [:0]const u8 {
     if (isBinPathNormalized(path)) return path;
-    const duped = arena.dupeZ(u8, path) catch |e| oom(e);
+    const duped = arena.dupeSentinel(u8, path, 0) catch |e| oom(e);
     std.mem.replaceScalar(u8, duped, '/', '\\');
     // sanity check that isBinPathNormalized wasn't lying
     std.debug.assert(isBinPathNormalized(duped));
@@ -165,7 +203,7 @@ fn normalizeBinPath(arena: std.mem.Allocator, path: [:0]const u8) [:0]const u8 {
     return duped;
 }
 
-fn setBinPath(arena: std.mem.Allocator, arg_it: *std.process.ArgIterator, mode: enum { require_new, update }) !u8 {
+fn setBinPath(arena: std.mem.Allocator, ctx: *const ProcessEnv, arg_it: *std.process.Args.Iterator, mode: enum { require_new, update }) !u8 {
     var maybe_app_data: ?[:0]const u8 = null;
     const bin_path = blk: {
         while (arg_it.next()) |arg| {
@@ -183,7 +221,7 @@ fn setBinPath(arena: std.mem.Allocator, arg_it: *std.process.ArgIterator, mode: 
         errExit("new-bin-path requires a PATH argument", .{});
     };
 
-    const app_data_path = maybe_app_data orelse allocAppDataPath(arena);
+    const app_data_path = maybe_app_data orelse allocAppDataPath(arena, ctx.environ);
 
     var bin_setting_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const bin_setting_path = std.fmt.bufPrint(
@@ -196,7 +234,7 @@ fn setBinPath(arena: std.mem.Allocator, arg_it: *std.process.ArgIterator, mode: 
         .update => @panic("todo"),
         .require_new => {
             var val_buf: [std.fs.max_path_bytes]u8 = undefined;
-            if (try readBinPath(bin_setting_path, &val_buf)) |stored| {
+            if (try readBinPath(ctx.io, bin_setting_path, &val_buf)) |stored| {
                 if (std.mem.eql(u8, stored, bin_path)) {
                     log.info("bin path is already set to '{s}'", .{bin_path});
                     return 0;
@@ -207,19 +245,12 @@ fn setBinPath(arena: std.mem.Allocator, arg_it: *std.process.ArgIterator, mode: 
         },
     }
 
-    const path_env = if (builtin.os.tag == .windows)
-        std.process.getEnvVarOwned(arena, "PATH") catch |err| switch (err) {
-            error.EnvironmentVariableNotFound => errExit("PATH environment variable not found", .{}),
-            error.OutOfMemory => |e| oom(e),
-            error.InvalidWtf8 => errExit("PATH is invalid wtf8", .{}),
-        }
-    else
-        std.posix.getenv("PATH") orelse "";
+    const path_env = allocPathEnv(arena, ctx.environ) orelse errExit("PATH environment variable not found", .{});
 
     const in_path = blk_in_path: {
-        var it = std.mem.tokenizeScalar(u8, path_env, if (builtin.os.tag == .windows) ';' else ':');
+        var it = std.mem.tokenizeScalar(u8, path_env, path_env_sep);
         while (it.next()) |entry| {
-            const expanded = try pathenv.expand(arena, entry);
+            const expanded = try pathenv.expand(arena, ctx.environ, entry);
             if (binPathEql(expanded, bin_path)) break :blk_in_path true;
         }
         break :blk_in_path false;
@@ -227,17 +258,19 @@ fn setBinPath(arena: std.mem.Allocator, arg_it: *std.process.ArgIterator, mode: 
     if (!in_path) errExit("'{s}' is not in the PATH environment variable", .{bin_path});
 
     // Validate the path is writable.
-    switch (try checkBinPath(bin_path)) {
+    switch (try checkBinPath(ctx.io, bin_path)) {
         .ok => {},
         .bad => |reason| errExit("'{s}' is not a valid bin path: {t}", .{ bin_path, reason }),
     }
 
-    try writeBinPath(bin_setting_path, bin_path);
+    try writeBinPath(ctx.io, bin_setting_path, bin_path);
     log.info("bin path set to '{s}'", .{bin_path});
     return 0;
 }
 
 const InstallConfig = struct {
+    ctx: *const ProcessEnv,
+    git_auth: *GitAuth,
     interactive: bool,
     keep_archives: bool,
     allow_overwrite: bool,
@@ -272,8 +305,8 @@ fn allocAnyzigPath(allocator: std.mem.Allocator, app_data_path: []const u8, vers
     );
 }
 
-fn fileExistsAbsolute(path: []const u8) !bool {
-    return if (std.fs.accessAbsolute(path, .{})) true else |err| switch (err) {
+fn fileExistsAbsolute(io: std.Io, path: []const u8) !bool {
+    return if (std.Io.Dir.accessAbsolute(io, path, .{})) true else |err| switch (err) {
         error.FileNotFound => false,
         else => |e| e,
     };
@@ -298,11 +331,12 @@ fn versionFromAnyzigExe(anyzig_exe: []const u8) [11]u8 {
 // Download anyzig if not already present. Uses a lock file to prevent races.
 fn ensureAnyzig(
     scratch: *Scratch,
-    cache_path: [:0]const u8,
+    config: *const InstallConfig,
     anyzig_exe: []const u8,
 ) !void {
+    const io = config.ctx.io;
     const version = versionFromAnyzigExe(anyzig_exe);
-    if (try fileExistsAbsolute(anyzig_exe)) {
+    if (try fileExistsAbsolute(io, anyzig_exe)) {
         log.info("using existing anyzig at {s}", .{anyzig_exe});
         return;
     }
@@ -314,16 +348,17 @@ fn ensureAnyzig(
     defer scratch.free(lock_path);
 
     var lock_file = LockFile.lock(
+        io,
         lock_path,
     ) catch |err| return reportError("lock '{s}' failed with {t}", .{ lock_path, err });
-    defer lock_file.unlock();
+    defer lock_file.unlock(io);
 
     // Re-check after acquiring lock (another process may have completed)
-    if (try fileExistsAbsolute(anyzig_exe)) {
+    if (try fileExistsAbsolute(io, anyzig_exe)) {
         log.info("using existing anyzig at {s}", .{anyzig_exe});
         return;
     }
-    errdefer std.fs.deleteFileAbsolute(anyzig_exe) catch |err| switch (err) {
+    errdefer std.Io.Dir.deleteFileAbsolute(io, anyzig_exe) catch |err| switch (err) {
         error.FileNotFound => {},
         else => log.err("clean up '{s}' failed with {t}", .{ anyzig_exe, err }),
     };
@@ -347,112 +382,101 @@ fn ensureAnyzig(
     const pkg_cache_path = std.fmt.allocPrint(
         scratch.allocator(),
         "{s}{c}anyzig-{s}-{s}-{s}",
-        .{ cache_path, std.fs.path.sep, version, arch, os },
+        .{ config.cache_path, std.fs.path.sep, version, arch, os },
     ) catch |e| oom(e);
     defer scratch.free(pkg_cache_path);
 
-    var client: std.http.Client = .{ .allocator = scratch.allocator() };
+    var client: std.http.Client = .{ .allocator = scratch.allocator(), .io = io };
     defer client.deinit();
 
-    try downloadToCache(scratch, &client, asset_url, pkg_cache_path);
+    try downloadToCache(scratch, .{ .ctx = config.ctx, .client = &client, .git_auth = config.git_auth }, asset_url, pkg_cache_path);
 
+    const cwd = std.Io.Dir.cwd();
     const dest_dir_path = std.fs.path.dirname(anyzig_exe) orelse ".";
-    std.fs.cwd().makePath(dest_dir_path) catch |err| return reportError(
-        "makePath '{s}' failed with {t}",
+    cwd.createDirPath(io, dest_dir_path) catch |err| return reportError(
+        "create directory '{s}' failed with {t}",
         .{ dest_dir_path, err },
     );
 
-    const extract_dir_path = allocTmpPath(scratch.allocator(), "hew-anyzig-{s}", .{version});
+    const extract_dir_path = allocTmpPath(scratch.allocator(), config.ctx.tmp_dir, "hew-anyzig-{s}", .{version});
     defer scratch.free(extract_dir_path);
 
-    std.fs.deleteTreeAbsolute(extract_dir_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return reportError("deleteTree '{s}' failed with {t}", .{ extract_dir_path, err }),
-    };
-    std.fs.cwd().makePath(extract_dir_path) catch |err| return reportError(
-        "makePath '{s}' failed with {t}",
+    cwd.deleteTree(io, extract_dir_path) catch |err|
+        return reportError("deleteTree '{s}' failed with {t}", .{ extract_dir_path, err });
+    cwd.createDirPath(io, extract_dir_path) catch |err| return reportError(
+        "create directory '{s}' failed with {t}",
         .{ extract_dir_path, err },
     );
 
-    const archive_data = std.fs.cwd().readFileAlloc(
-        scratch.allocator(),
-        pkg_cache_path,
-        std.math.maxInt(usize),
-    ) catch |err| return reportError("read '{s}' failed with {t}", .{ pkg_cache_path, err });
-    defer scratch.free(archive_data);
-
     {
-        var extract_dir = std.fs.openDirAbsolute(extract_dir_path, .{}) catch |err| return reportError(
+        var extract_dir = std.Io.Dir.openDirAbsolute(io, extract_dir_path, .{}) catch |err| return reportError(
             "open '{s}' failed with {t}",
             .{ extract_dir_path, err },
         );
-        defer extract_dir.close();
+        defer extract_dir.close(io);
+
+        const archive_file = cwd.openFile(io, pkg_cache_path, .{}) catch |err| return reportError(
+            "open '{s}' failed with {t}",
+            .{ pkg_cache_path, err },
+        );
+        defer archive_file.close(io);
+        var archive_read_buf: [4096]u8 = undefined;
+        var archive_reader = archive_file.reader(io, &archive_read_buf);
 
         if (builtin.os.tag == .windows) {
-            const zip_file = std.fs.cwd().openFile(pkg_cache_path, .{}) catch |err| return reportError(
-                "open '{s}' failed with {t}",
-                .{ pkg_cache_path, err },
-            );
-            defer zip_file.close();
-            var zip_read_buf: [4096]u8 = undefined;
-            var file_reader: std.fs.File.Reader = .init(zip_file, &zip_read_buf);
             var diagnostics: std.zip.Diagnostics = .{ .allocator = scratch.allocator() };
             defer diagnostics.deinit();
-            std.zip.extract(extract_dir, &file_reader, .{ .diagnostics = &diagnostics }) catch |err| return reportError(
+            std.zip.extract(extract_dir, &archive_reader, .{ .diagnostics = &diagnostics }) catch |err| return reportError(
                 "extract anyzig zip failed with {t}",
                 .{err},
             );
             if (diagnostics.root_dir.len > 0) {
-                extract_dir.close();
-                extract_dir = std.fs.openDirAbsolute(
-                    std.fmt.allocPrint(scratch.allocator(), "{s}/{s}", .{ extract_dir_path, diagnostics.root_dir }) catch |e| oom(e),
-                    .{},
-                ) catch |err| return reportError(
+                extract_dir.close(io);
+                extract_dir = extract_dir.openDir(io, diagnostics.root_dir, .{}) catch |err| return reportError(
                     "open extracted root dir failed with {t}",
                     .{err},
                 );
             }
         } else {
             var decompress_buf: [std.compress.flate.max_window_len]u8 = undefined;
-            var tar_reader: std.Io.Reader = .fixed(archive_data);
-            var decompressor: std.compress.flate.Decompress = .init(&tar_reader, .gzip, &decompress_buf);
-            std.tar.pipeToFileSystem(extract_dir, &decompressor.reader, .{}) catch |err| return reportError(
+            var decompressor: std.compress.flate.Decompress = .init(&archive_reader.interface, .gzip, &decompress_buf);
+            std.tar.extract(io, extract_dir, &decompressor.reader, .{}) catch |err| return reportError(
                 "extract anyzig failed with {t}",
                 .{err},
             );
         }
 
-        var dest_dir = std.fs.openDirAbsolute(dest_dir_path, .{}) catch |err| return reportError(
+        var dest_dir = std.Io.Dir.openDirAbsolute(io, dest_dir_path, .{}) catch |err| return reportError(
             "open '{s}' failed with {t}",
             .{ dest_dir_path, err },
         );
-        defer dest_dir.close();
+        defer dest_dir.close(io);
         const zig_name = if (builtin.os.tag == .windows) "zig.exe" else "zig";
         const anyzig_basename = std.fs.path.basename(anyzig_exe);
-        extract_dir.copyFile(zig_name, dest_dir, anyzig_basename, .{}) catch |err| return reportError(
+        extract_dir.copyFile(zig_name, dest_dir, anyzig_basename, io, .{}) catch |err| return reportError(
             "copy anyzig to '{s}' failed with {t}",
             .{ anyzig_exe, err },
         );
-        std.debug.assert(try fileExistsAbsolute(anyzig_exe));
+        std.debug.assert(try fileExistsAbsolute(io, anyzig_exe));
     }
 
     log.info("installed anyzig to {s}", .{anyzig_exe});
     log.info("clean source: rm -rf {s}", .{extract_dir_path});
-    std.fs.deleteTreeAbsolute(extract_dir_path) catch |err|
+    cwd.deleteTree(io, extract_dir_path) catch |err|
         return reportError("deleteTree '{s}' failed with {t}", .{ extract_dir_path, err });
     log.info("clean archive: rm {s}", .{pkg_cache_path});
-    std.fs.deleteFileAbsolute(pkg_cache_path) catch |err|
+    std.Io.Dir.deleteFileAbsolute(io, pkg_cache_path) catch |err|
         return reportError("delete '{s}' failed with {t}", .{ pkg_cache_path, err });
 }
 
 const GitArchive = union(enum) {
     rev: struct {
-        json: std.ArrayListUnmanaged(u8),
+        json: std.ArrayList(u8),
         rev_name: []const u8,
         tarball_url: []const u8,
     },
     tip: struct {
-        json: std.ArrayListUnmanaged(u8),
+        json: std.ArrayList(u8),
         sha: GitSha,
         tarball_url: []const u8,
     },
@@ -493,7 +517,7 @@ const GitArchive = union(enum) {
     };
 };
 
-fn getLatestReleaseGithub(scratch: *Scratch, client: *std.http.Client, owner_repo: *const OwnerRepo) GitArchive {
+fn getLatestReleaseGithub(scratch: *Scratch, http: Http, owner_repo: *const OwnerRepo) GitArchive {
     log.info("fetching latest release for github:{s}...", .{owner_repo.string});
     const release_url = std.fmt.allocPrint(
         scratch.allocator(),
@@ -501,18 +525,18 @@ fn getLatestReleaseGithub(scratch: *Scratch, client: *std.http.Client, owner_rep
         .{owner_repo.string},
     ) catch |e| oom(e);
     defer scratch.allocator().free(release_url);
-    var timer = timerStart();
-    var fetch_result = fetchGitJson(release_url, client, scratch.allocator());
+    var timer: Timer = .init(http.ctx.io);
+    var fetch_result = fetchGitJson(release_url, http, scratch.allocator());
     errdefer fetch_result.body.deinit(scratch.allocator());
     if (fetch_result.status == .ok) {
-        const elapsed: f64 = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_s;
+        const elapsed = timer.seconds();
         log.info("fetched latest release JSON in {d:.2} seconds", .{elapsed});
         const release = blk_release: {
             var err: ParseJsonError = undefined;
             break :blk_release parseReleaseGithub(
                 fetch_result.body.items,
                 &err,
-            ) catch jsonErrorExit(scratch, release_url, fetch_result.body.items, &err);
+            ) catch jsonErrorExit(scratch, http.ctx, release_url, fetch_result.body.items, &err);
         };
         log.info("latest release is tag {s}", .{release.tag_name});
         return .{ .rev = .{
@@ -527,7 +551,7 @@ fn getLatestReleaseGithub(scratch: *Scratch, client: *std.http.Client, owner_rep
         const is_no_releases = fetch_result.status == .not_found and blk_msg: {
             var err: ParseJsonError = undefined;
             const msg = parseMessage(fetch_result.body.items, &err) catch
-                jsonErrorExit(scratch, release_url, fetch_result.body.items, &err);
+                jsonErrorExit(scratch, http.ctx, release_url, fetch_result.body.items, &err);
             break :blk_msg std.mem.eql(u8, msg, "Not Found");
         };
         if (!is_no_releases)
@@ -543,21 +567,21 @@ fn getLatestReleaseGithub(scratch: *Scratch, client: *std.http.Client, owner_rep
         .{owner_repo.string},
     ) catch |e| oom(e);
     defer scratch.allocator().free(tags_url);
-    timer = timerStart();
-    var tags_result = fetchGitJson(tags_url, client, scratch.allocator());
+    timer = .init(http.ctx.io);
+    var tags_result = fetchGitJson(tags_url, http, scratch.allocator());
     errdefer tags_result.body.deinit(scratch.allocator());
     if (tags_result.status != .ok)
         fetchErrExit(tags_url, tags_result);
-    const tags_elapsed: f64 = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_s;
+    const tags_elapsed = timer.seconds();
     log.info("fetched latest tag JSON in {d:.2} seconds", .{tags_elapsed});
     const tag_name = blk_tag: {
         var err: ParseJsonError = undefined;
         break :blk_tag (parseLatestTagGithub(tags_result.body.items, &err) catch |e| switch (e) {
-            error.ParseJson => jsonErrorExit(scratch, tags_url, tags_result.body.items, &err),
+            error.ParseJson => jsonErrorExit(scratch, http.ctx, tags_url, tags_result.body.items, &err),
         }) orelse {
             log.info("no tags found either, falling back to tip for github:{s}...", .{owner_repo.string});
             tags_result.body.deinit(scratch.allocator());
-            const tip_archive = fetchTipGithub(scratch, scratch.allocator(), owner_repo, client);
+            const tip_archive = fetchTipGithub(scratch, scratch.allocator(), owner_repo, http);
             log.info("tip is commit {f}", .{&tip_archive.tip.sha});
             return tip_archive;
         };
@@ -569,7 +593,7 @@ fn getLatestReleaseGithub(scratch: *Scratch, client: *std.http.Client, owner_rep
         .tarball_url = allocUrlGithubTarball(scratch.allocator(), owner_repo, tag_name),
     } };
 }
-fn getLatestReleaseCodeberg(scratch: *Scratch, client: *std.http.Client, owner_repo: *const OwnerRepo) GitArchive {
+fn getLatestReleaseCodeberg(scratch: *Scratch, http: Http, owner_repo: *const OwnerRepo) GitArchive {
     log.info("fetching latest release for codeberg:{s}...", .{owner_repo.string});
     const release_url = std.fmt.allocPrint(
         scratch.allocator(),
@@ -577,18 +601,18 @@ fn getLatestReleaseCodeberg(scratch: *Scratch, client: *std.http.Client, owner_r
         .{owner_repo.string},
     ) catch |e| oom(e);
     defer scratch.allocator().free(release_url);
-    var timer = timerStart();
-    var fetch_result = fetchGitJson(release_url, client, scratch.allocator());
+    var timer: Timer = .init(http.ctx.io);
+    var fetch_result = fetchGitJson(release_url, http, scratch.allocator());
     errdefer fetch_result.body.deinit(scratch.allocator());
     if (fetch_result.status == .ok) {
-        const elapsed: f64 = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_s;
+        const elapsed = timer.seconds();
         log.info("fetched latest release JSON in {d:.2} seconds", .{elapsed});
         const release = blk_release: {
             var err: ParseJsonError = undefined;
             break :blk_release parseReleaseCodeberg(
                 fetch_result.body.items,
                 &err,
-            ) catch jsonErrorExit(scratch, release_url, fetch_result.body.items, &err);
+            ) catch jsonErrorExit(scratch, http.ctx, release_url, fetch_result.body.items, &err);
         };
         log.info("latest release is tag {s}", .{release.tag_name});
         return .{ .rev = .{
@@ -606,7 +630,7 @@ fn getLatestReleaseCodeberg(scratch: *Scratch, client: *std.http.Client, owner_r
         const is_no_releases = fetch_result.status == .not_found and blk_msg: {
             var err: ParseJsonError = undefined;
             const msg = parseMessage(fetch_result.body.items, &err) catch
-                jsonErrorExit(scratch, release_url, fetch_result.body.items, &err);
+                jsonErrorExit(scratch, http.ctx, release_url, fetch_result.body.items, &err);
             break :blk_msg std.mem.eql(u8, msg, "The target couldn't be found.");
         };
         if (!is_no_releases)
@@ -622,21 +646,21 @@ fn getLatestReleaseCodeberg(scratch: *Scratch, client: *std.http.Client, owner_r
         .{owner_repo.string},
     ) catch |e| oom(e);
     defer scratch.allocator().free(tags_url);
-    timer = timerStart();
-    var tags_result = fetchGitJson(tags_url, client, scratch.allocator());
+    timer = .init(http.ctx.io);
+    var tags_result = fetchGitJson(tags_url, http, scratch.allocator());
     errdefer tags_result.body.deinit(scratch.allocator());
     if (tags_result.status != .ok)
         fetchErrExit(tags_url, tags_result);
-    const tags_elapsed: f64 = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_s;
+    const tags_elapsed = timer.seconds();
     log.info("fetched latest tag JSON in {d:.2} seconds", .{tags_elapsed});
     const tag_name = blk_tag: {
         var err: ParseJsonError = undefined;
         break :blk_tag (parseLatestTagCodeberg(tags_result.body.items, &err) catch |e| switch (e) {
-            error.ParseJson => jsonErrorExit(scratch, tags_url, tags_result.body.items, &err),
+            error.ParseJson => jsonErrorExit(scratch, http.ctx, tags_url, tags_result.body.items, &err),
         }) orelse {
             log.info("no tags found either, falling back to tip for codeberg:{s}...", .{owner_repo.string});
             tags_result.body.deinit(scratch.allocator());
-            const tip_archive = fetchTipCodeberg(scratch, scratch.allocator(), owner_repo, client);
+            const tip_archive = fetchTipCodeberg(scratch, scratch.allocator(), owner_repo, http);
             log.info("tip is commit {f}", .{&tip_archive.tip.sha});
             return tip_archive;
         };
@@ -680,7 +704,7 @@ const FmtGitlabProjectId = struct {
         try w.print("{s}%2F{s}", .{ f.owner_repo.owner(), f.owner_repo.repo() });
     }
 };
-fn getLatestReleaseGitlab(scratch: *Scratch, client: *std.http.Client, owner_repo: *const OwnerRepo) GitArchive {
+fn getLatestReleaseGitlab(scratch: *Scratch, http: Http, owner_repo: *const OwnerRepo) GitArchive {
     log.info("fetching latest release for gitlab:{s}...", .{owner_repo.string});
     const release_url = std.fmt.allocPrint(
         scratch.allocator(),
@@ -688,18 +712,18 @@ fn getLatestReleaseGitlab(scratch: *Scratch, client: *std.http.Client, owner_rep
         .{fmtGitlabProjectId(owner_repo)},
     ) catch |e| oom(e);
     defer scratch.allocator().free(release_url);
-    var timer = timerStart();
-    var fetch_result = fetchGitJson(release_url, client, scratch.allocator());
+    var timer: Timer = .init(http.ctx.io);
+    var fetch_result = fetchGitJson(release_url, http, scratch.allocator());
     errdefer fetch_result.body.deinit(scratch.allocator());
     if (fetch_result.status == .ok) {
-        const elapsed: f64 = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_s;
+        const elapsed = timer.seconds();
         log.info("fetched latest release JSON in {d:.2} seconds", .{elapsed});
         const release = blk_release: {
             var err: ParseJsonError = undefined;
             break :blk_release parseReleaseGitlab(
                 fetch_result.body.items,
                 &err,
-            ) catch jsonErrorExit(scratch, release_url, fetch_result.body.items, &err);
+            ) catch jsonErrorExit(scratch, http.ctx, release_url, fetch_result.body.items, &err);
         };
         log.info("latest release is tag {s}", .{release.tag_name});
         return .{ .rev = .{
@@ -715,7 +739,7 @@ fn getLatestReleaseGitlab(scratch: *Scratch, client: *std.http.Client, owner_rep
         const is_no_releases = fetch_result.status == .not_found and blk_msg: {
             var err: ParseJsonError = undefined;
             const msg = parseMessage(fetch_result.body.items, &err) catch
-                jsonErrorExit(scratch, release_url, fetch_result.body.items, &err);
+                jsonErrorExit(scratch, http.ctx, release_url, fetch_result.body.items, &err);
             break :blk_msg std.mem.eql(u8, msg, "404 Not Found");
         };
         if (!is_no_releases)
@@ -731,22 +755,22 @@ fn getLatestReleaseGitlab(scratch: *Scratch, client: *std.http.Client, owner_rep
         .{fmtGitlabProjectId(owner_repo)},
     ) catch |e| oom(e);
     defer scratch.allocator().free(tags_url);
-    timer = timerStart();
-    var tags_result = fetchGitJson(tags_url, client, scratch.allocator());
+    timer = .init(http.ctx.io);
+    var tags_result = fetchGitJson(tags_url, http, scratch.allocator());
     errdefer tags_result.body.deinit(scratch.allocator());
     if (tags_result.status != .ok)
         fetchErrExit(tags_url, tags_result);
-    const tags_elapsed: f64 = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_s;
+    const tags_elapsed = timer.seconds();
     log.info("fetched latest tag JSON in {d:.2} seconds", .{tags_elapsed});
 
     const tag_name = blk_tag: {
         var err: ParseJsonError = undefined;
         break :blk_tag (parseLatestTagGitlab(tags_result.body.items, &err) catch |e| switch (e) {
-            error.ParseJson => jsonErrorExit(scratch, tags_url, tags_result.body.items, &err),
+            error.ParseJson => jsonErrorExit(scratch, http.ctx, tags_url, tags_result.body.items, &err),
         }) orelse {
             log.info("no tags found either, falling back to tip for gitlab:{s}...", .{owner_repo.string});
             tags_result.body.deinit(scratch.allocator());
-            const tip_archive = fetchTipGitlab(scratch, scratch.allocator(), owner_repo, client);
+            const tip_archive = fetchTipGitlab(scratch, scratch.allocator(), owner_repo, http);
             log.info("tip is commit {f}", .{&tip_archive.tip.sha});
             return tip_archive;
         };
@@ -759,7 +783,7 @@ fn getLatestReleaseGitlab(scratch: *Scratch, client: *std.http.Client, owner_rep
     } };
 }
 
-fn fetchTipGithub(scratch: *Scratch, allocator: std.mem.Allocator, owner_repo: *const OwnerRepo, client: *std.http.Client) GitArchive {
+fn fetchTipGithub(scratch: *Scratch, allocator: std.mem.Allocator, owner_repo: *const OwnerRepo, http: Http) GitArchive {
     log.info("fetching tip commit for github:{s}...", .{owner_repo.string});
     const commit_url = std.fmt.allocPrint(
         scratch.allocator(),
@@ -767,18 +791,18 @@ fn fetchTipGithub(scratch: *Scratch, allocator: std.mem.Allocator, owner_repo: *
         .{owner_repo.string},
     ) catch |e| oom(e);
     defer scratch.allocator().free(commit_url);
-    var timer = timerStart();
-    const commit_result = fetchGitJson(commit_url, client, allocator);
+    var timer: Timer = .init(http.ctx.io);
+    const commit_result = fetchGitJson(commit_url, http, allocator);
     if (commit_result.status != .ok)
         fetchErrExit(commit_url, commit_result);
-    const elapsed: f64 = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_s;
+    const elapsed = timer.seconds();
     log.info("fetched tip commit JSON in {d:.2} seconds", .{elapsed});
     const sha = blk: {
         var err: ParseJsonError = undefined;
         break :blk parseCommitShaGithub(
             commit_result.body.items,
             &err,
-        ) catch jsonErrorExit(scratch, commit_url, commit_result.body.items, &err);
+        ) catch jsonErrorExit(scratch, http.ctx, commit_url, commit_result.body.items, &err);
     };
     const sha_hex = sha.hex();
     const tarball_url = allocUrlGithubTarball(allocator, owner_repo, &sha_hex);
@@ -790,7 +814,7 @@ fn fetchTipGithub(scratch: *Scratch, allocator: std.mem.Allocator, owner_repo: *
     } };
 }
 
-fn fetchTipGitlab(scratch: *Scratch, allocator: std.mem.Allocator, owner_repo: *const OwnerRepo, client: *std.http.Client) GitArchive {
+fn fetchTipGitlab(scratch: *Scratch, allocator: std.mem.Allocator, owner_repo: *const OwnerRepo, http: Http) GitArchive {
     log.info("fetching tip commit for gitlab:{s}...", .{owner_repo.string});
     const commit_url = std.fmt.allocPrint(
         scratch.allocator(),
@@ -798,18 +822,18 @@ fn fetchTipGitlab(scratch: *Scratch, allocator: std.mem.Allocator, owner_repo: *
         .{fmtGitlabProjectId(owner_repo)},
     ) catch |e| oom(e);
     defer scratch.allocator().free(commit_url);
-    var timer = timerStart();
-    const commit_result = fetchGitJson(commit_url, client, allocator);
+    var timer: Timer = .init(http.ctx.io);
+    const commit_result = fetchGitJson(commit_url, http, allocator);
     if (commit_result.status != .ok)
         fetchErrExit(commit_url, commit_result);
-    const elapsed: f64 = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_s;
+    const elapsed = timer.seconds();
     log.info("fetched tip commit JSON in {d:.2} seconds", .{elapsed});
     const sha = blk: {
         var err: ParseJsonError = undefined;
         break :blk parseCommitShaGitlab(
             commit_result.body.items,
             &err,
-        ) catch jsonErrorExit(scratch, commit_url, commit_result.body.items, &err);
+        ) catch jsonErrorExit(scratch, http.ctx, commit_url, commit_result.body.items, &err);
     };
     const tarball_url = std.fmt.allocPrint(
         allocator,
@@ -823,7 +847,7 @@ fn fetchTipGitlab(scratch: *Scratch, allocator: std.mem.Allocator, owner_repo: *
         .tarball_url = tarball_url,
     } };
 }
-fn fetchTipCodeberg(scratch: *Scratch, allocator: std.mem.Allocator, owner_repo: *const OwnerRepo, client: *std.http.Client) GitArchive {
+fn fetchTipCodeberg(scratch: *Scratch, allocator: std.mem.Allocator, owner_repo: *const OwnerRepo, http: Http) GitArchive {
     log.info("fetching tip commit for codeberg:{s}...", .{owner_repo.string});
     const commit_url = std.fmt.allocPrint(
         scratch.allocator(),
@@ -831,18 +855,18 @@ fn fetchTipCodeberg(scratch: *Scratch, allocator: std.mem.Allocator, owner_repo:
         .{owner_repo.string},
     ) catch |e| oom(e);
     defer scratch.allocator().free(commit_url);
-    var timer = timerStart();
-    const commit_result = fetchGitJson(commit_url, client, allocator);
+    var timer: Timer = .init(http.ctx.io);
+    const commit_result = fetchGitJson(commit_url, http, allocator);
     if (commit_result.status != .ok)
         fetchErrExit(commit_url, commit_result);
-    const elapsed: f64 = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_s;
+    const elapsed = timer.seconds();
     log.info("fetched tip commit JSON in {d:.2} seconds", .{elapsed});
     const sha = blk: {
         var err: ParseJsonError = undefined;
         break :blk parseCommitShaCodeberg(
             commit_result.body.items,
             &err,
-        ) catch jsonErrorExit(scratch, commit_url, commit_result.body.items, &err);
+        ) catch jsonErrorExit(scratch, http.ctx, commit_url, commit_result.body.items, &err);
     };
     const sha_hex = sha.hex();
     const tarball_url = allocUrlCodebergTarball(allocator, owner_repo, &sha_hex);
@@ -857,17 +881,19 @@ fn fetchTipCodeberg(scratch: *Scratch, allocator: std.mem.Allocator, owner_repo:
 fn installPkgGit(scratch: *Scratch, config: *const InstallConfig, pkg: PkgGit) !void {
     const scratch_pos = scratch.position();
     defer scratch.restorePosition(scratch_pos);
-    var client: std.http.Client = .{ .allocator = scratch.allocator() };
+    const io = config.ctx.io;
+    var client: std.http.Client = .{ .allocator = scratch.allocator(), .io = io };
     defer client.deinit();
+    const http: Http = .{ .ctx = config.ctx, .client = &client, .git_auth = config.git_auth };
 
     var archive: GitArchive = blk: switch (pkg.commit) {
         .latest_release => switch (pkg.host) {
-            .github => getLatestReleaseGithub(scratch, &client, &pkg.owner_repo),
-            .gitlab => getLatestReleaseGitlab(scratch, &client, &pkg.owner_repo),
-            .codeberg => getLatestReleaseCodeberg(scratch, &client, &pkg.owner_repo),
+            .github => getLatestReleaseGithub(scratch, http, &pkg.owner_repo),
+            .gitlab => getLatestReleaseGitlab(scratch, http, &pkg.owner_repo),
+            .codeberg => getLatestReleaseCodeberg(scratch, http, &pkg.owner_repo),
         },
         .rev => |rev| break :blk .{ .rev = .{
-            .json = .{},
+            .json = .empty,
             .rev_name = rev,
             .tarball_url = switch (pkg.host) {
                 .github => allocUrlGithubTarball(scratch.allocator(), &pkg.owner_repo, rev),
@@ -880,19 +906,19 @@ fn installPkgGit(scratch: *Scratch, config: *const InstallConfig, pkg: PkgGit) !
                 scratch,
                 scratch.allocator(),
                 &pkg.owner_repo,
-                &client,
+                http,
             ),
             .gitlab => fetchTipGitlab(
                 scratch,
                 scratch.allocator(),
                 &pkg.owner_repo,
-                &client,
+                http,
             ),
             .codeberg => fetchTipCodeberg(
                 scratch,
                 scratch.allocator(),
                 &pkg.owner_repo,
-                &client,
+                http,
             ),
         },
     };
@@ -904,7 +930,7 @@ fn installPkgGit(scratch: *Scratch, config: *const InstallConfig, pkg: PkgGit) !
         .{ config.app_data_path, std.fs.path.sep, pkg.host, pkg.owner(), pkg.repo(), archive.fmtUniqueName() },
     ) catch |e| oom(e);
     defer scratch.allocator().free(manifest_path);
-    if (std.fs.cwd().readFileAlloc(scratch.allocator(), manifest_path, std.math.maxInt(usize))) |manifest| {
+    if (std.Io.Dir.cwd().readFileAlloc(io, manifest_path, scratch.allocator(), .unlimited)) |manifest| {
         defer scratch.freeLifo(manifest);
         var line_it = std.mem.tokenizeScalar(u8, manifest, '\n');
 
@@ -932,42 +958,42 @@ fn installPkgGit(scratch: *Scratch, config: *const InstallConfig, pkg: PkgGit) !
     ) catch |e| oom(e);
     defer scratch.free(pkg_cache_path);
 
-    try downloadToCache(scratch, &client, archive.url(), pkg_cache_path);
-
-    const tarball_data = std.fs.cwd().readFileAlloc(
-        scratch.allocator(),
-        pkg_cache_path,
-        std.math.maxInt(usize),
-    ) catch |err| return reportError("read '{s}' failed with {t}", .{ pkg_cache_path, err });
-    defer scratch.free(tarball_data);
+    try downloadToCache(scratch, http, archive.url(), pkg_cache_path);
 
     const extract_dir_path = allocTmpPath(
         scratch.allocator(),
+        config.ctx.tmp_dir,
         "hew-{t}-{s}-{s}-{f}",
         .{ pkg.host, pkg.owner(), pkg.repo(), archive.fmtUniqueName() },
     );
     defer scratch.free(extract_dir_path);
 
-    std.fs.deleteTreeAbsolute(extract_dir_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => |e| return reportError("deleteTree '{s}' failed with {t}", .{ extract_dir_path, e }),
-    };
-    std.fs.makeDirAbsolute(extract_dir_path) catch |err| return reportError(
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(io, extract_dir_path) catch |err|
+        return reportError("deleteTree '{s}' failed with {t}", .{ extract_dir_path, err });
+    std.Io.Dir.createDirAbsolute(io, extract_dir_path, .default_dir) catch |err| return reportError(
         "create '{s}' failed with {t}",
         .{ extract_dir_path, err },
     );
     {
-        var extract_dir = std.fs.openDirAbsolute(extract_dir_path, .{}) catch |err| return reportError(
+        var extract_dir = std.Io.Dir.openDirAbsolute(io, extract_dir_path, .{}) catch |err| return reportError(
             "open '{s}' failed with {t}",
             .{ extract_dir_path, err },
         );
-        defer extract_dir.close();
+        defer extract_dir.close(io);
 
+        const tarball_file = cwd.openFile(io, pkg_cache_path, .{}) catch |err| return reportError(
+            "open '{s}' failed with {t}",
+            .{ pkg_cache_path, err },
+        );
+        defer tarball_file.close(io);
+        var tarball_read_buf: [4096]u8 = undefined;
+        var tarball_reader = tarball_file.reader(io, &tarball_read_buf);
         var decompress_buf: [std.compress.flate.max_window_len]u8 = undefined;
-        var tar_reader: std.Io.Reader = .fixed(tarball_data);
-        var decompressor: std.compress.flate.Decompress = .init(&tar_reader, .gzip, &decompress_buf);
+        var decompressor: std.compress.flate.Decompress = .init(&tarball_reader.interface, .gzip, &decompress_buf);
 
-        std.tar.pipeToFileSystem(
+        std.tar.extract(
+            io,
             extract_dir,
             &decompressor.reader,
             .{ .strip_components = 1 },
@@ -978,13 +1004,13 @@ fn installPkgGit(scratch: *Scratch, config: *const InstallConfig, pkg: PkgGit) !
         try installPkgPath(scratch, config, manifest_path, extract_dir_path, .{ .revision = revision });
     }
     log.info("clean source: rm -rf {s}", .{extract_dir_path});
-    std.fs.deleteTreeAbsolute(extract_dir_path) catch |err|
+    cwd.deleteTree(io, extract_dir_path) catch |err|
         return reportError("deleteTree '{s}' failed with {t}", .{ extract_dir_path, err });
     if (config.keep_archives) {
         log.info("keeping archive: {s}", .{pkg_cache_path});
     } else {
         log.info("clean archive: rm {s}", .{pkg_cache_path});
-        std.fs.deleteFileAbsolute(pkg_cache_path) catch |err|
+        std.Io.Dir.deleteFileAbsolute(io, pkg_cache_path) catch |err|
             return reportError("delete '{s}' failed with {t}", .{ pkg_cache_path, err });
     }
 }
@@ -1002,8 +1028,9 @@ fn binInstalled(
         .{ config.bin_path, std.fs.path.sep, name },
     ) catch |e| oom(e);
     defer scratch.freeLifo(expected);
+    const io = config.ctx.io;
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    var which_it = which.Iterator.fromEnv(&path_buf);
+    var which_it = which.Iterator.fromEnv(io, config.ctx.environ, &path_buf);
     while (try which_it.next(name)) |which_path| {
         if (std.mem.eql(u8, which_path, expected))
             break;
@@ -1016,7 +1043,7 @@ fn binInstalled(
         std.log.info("{s}: not installed", .{name});
         return false;
     }
-    const which_sha256 = try hashFile(std.fs.cwd(), expected);
+    const which_sha256 = try hashFile(io, std.Io.Dir.cwd(), expected);
     if (!std.mem.eql(u8, &which_sha256, sha256)) {
         std.log.info("{s}: installed but with different hash", .{name});
         return false;
@@ -1031,7 +1058,7 @@ fn binInstalled(
             .{ config.bin_path, std.fs.path.sep, stem },
         ) catch |e| oom(e);
         defer scratch.freeLifo(pdb_path);
-        const actual_pdb = hashFile(std.fs.cwd(), pdb_path) catch |err| switch (err) {
+        const actual_pdb = hashFile(io, std.Io.Dir.cwd(), pdb_path) catch |err| switch (err) {
             error.FileNotFound => {
                 std.log.info("{s}: pdb not installed", .{pdb_path});
                 return false;
@@ -1046,30 +1073,31 @@ fn binInstalled(
     return true;
 }
 
-fn hashFile(dir: std.fs.Dir, name: []const u8) ![32]u8 {
-    var file = try dir.openFile(name, .{});
-    defer file.close();
+fn hashFile(io: std.Io, dir: std.Io.Dir, name: []const u8) ![32]u8 {
+    const file = try dir.openFile(io, name, .{});
+    defer file.close(io);
+    var read_buf: [4096]u8 = undefined;
+    var reader = file.readerStreaming(io, &read_buf);
     var hasher = Sha256.init(.{});
     while (true) {
-        var read_buf: [4096]u8 = undefined;
-        const n = try file.read(&read_buf);
-        if (n == 0) break;
-        hasher.update(read_buf[0..n]);
+        const chunk = reader.interface.peekGreedy(1) catch |err| switch (err) {
+            error.EndOfStream => break,
+            error.ReadFailed => return reader.err.?,
+        };
+        hasher.update(chunk);
+        reader.interface.toss(chunk.len);
     }
     return hasher.finalResult();
 }
 
 fn runZigBuild(
-    scratch: *Scratch,
+    io: std.Io,
     zig_path: []const u8,
     path: []const u8,
-    dir: std.fs.Dir,
-    env_map: *const std.process.EnvMap,
+    dir: std.Io.Dir,
+    environ_map: *const std.process.Environ.Map,
     mode: enum { fetch, build },
 ) error{Reported}!void {
-    const position = scratch.position();
-    defer scratch.restorePosition(position);
-
     const optimize = "-Doptimize=ReleaseFast";
     const argv: []const []const u8 = switch (mode) {
         .fetch => &.{ zig_path, "build", "install", optimize, "--fetch" },
@@ -1087,36 +1115,34 @@ fn runZigBuild(
         } },
     );
 
-    var timer = timerStart();
-    var child = std.process.Child.init(argv, scratch.allocator());
-    child.cwd = path;
-    child.cwd_dir = dir;
-    child.env_map = env_map;
-
-    child.spawn() catch |err| return reportError("run {s} failed with {t}", .{ label, err });
-    const term = child.wait() catch |err| return reportError("{s} wait failed with {t}", .{ label, err });
-    const elapsed: f64 = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_s;
-    log.info("{s} completed in {d:.2} seconds", .{ label, elapsed });
+    const timer: Timer = .init(io);
+    var child = std.process.spawn(io, .{
+        .argv = argv,
+        .cwd = .{ .dir = dir },
+        .environ_map = environ_map,
+    }) catch |err| return reportError("run {s} failed with {t}", .{ label, err });
+    const term = child.wait(io) catch |err| return reportError("{s} wait failed with {t}", .{ label, err });
+    log.info("{s} completed in {d:.2} seconds", .{ label, timer.seconds() });
     switch (term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             errExit("{s} exited with code {d}", .{ label, code });
         },
-        .Signal => |sig| errExit("{s} killed by signal {d}", .{ label, sig }),
-        .Stopped => |sig| errExit("{s} stopped by signal {d}", .{ label, sig }),
-        .Unknown => |val| errExit("{s} terminated with unknown status {d}", .{ label, val }),
+        .signal => |sig| errExit("{s} killed by signal {t}", .{ label, sig }),
+        .stopped => |sig| errExit("{s} stopped by signal {t}", .{ label, sig }),
+        .unknown => |val| errExit("{s} terminated with unknown status {d}", .{ label, val }),
     }
 }
 
-fn writeManifest(scratch: *Scratch, manifest_path: []const u8, source_dir: std.fs.Dir) !void {
-    var zig_out = source_dir.openDir("zig-out", .{ .iterate = true }) catch |err| switch (err) {
+fn writeManifest(io: std.Io, scratch: *Scratch, manifest_path: []const u8, source_dir: std.Io.Dir) !void {
+    var zig_out = source_dir.openDir(io, "zig-out", .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => errExit("zig build did not install any files to zig-out", .{}),
         else => return reportError("open zig-out failed with {t}", .{err}),
     };
-    defer zig_out.close();
+    defer zig_out.close(io);
 
     // Verify only bin/ exists in zig-out
     var zig_out_it = zig_out.iterate();
-    while (zig_out_it.next() catch |err| return reportError(
+    while (zig_out_it.next(io) catch |err| return reportError(
         "iterate zig-out failed with {t}",
         .{err},
     )) |entry| {
@@ -1127,38 +1153,38 @@ fn writeManifest(scratch: *Scratch, manifest_path: []const u8, source_dir: std.f
         }
     }
 
-    var bin_dir = zig_out.openDir("bin", .{ .iterate = true }) catch |err|
+    var bin_dir = zig_out.openDir(io, "bin", .{ .iterate = true }) catch |err|
         return reportError("open zig-out/bin failed with {t}", .{err});
-    defer bin_dir.close();
+    defer bin_dir.close(io);
 
     const manifest_dir_path = std.fs.path.dirname(manifest_path) orelse ".";
-    std.fs.makeDirAbsolute(manifest_dir_path) catch |err| switch (err) {
+    std.Io.Dir.createDirAbsolute(io, manifest_dir_path, .default_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return reportError("create '{s}' failed with {t}", .{ manifest_dir_path, err }),
     };
-    var manifest_dir = std.fs.openDirAbsolute(manifest_dir_path, .{}) catch |err|
+    var manifest_dir = std.Io.Dir.openDirAbsolute(io, manifest_dir_path, .{}) catch |err|
         return reportError("open '{s}' failed with {t}", .{ manifest_dir_path, err });
-    defer manifest_dir.close();
+    defer manifest_dir.close(io);
 
     const manifest_name = std.fs.path.basename(manifest_path);
     const tmp_name = std.fmt.allocPrint(scratch.allocator(), "{s}.tmp", .{manifest_name}) catch |e| oom(e);
     defer scratch.freeLifo(tmp_name);
-    const file = manifest_dir.createFile(tmp_name, .{}) catch |err|
+    const file = manifest_dir.createFile(io, tmp_name, .{}) catch |err|
         return reportError("create '{s}/{s}' failed with {t}", .{ manifest_dir_path, tmp_name, err });
-    defer file.close();
+    defer file.close(io);
     var buf: [4096]u8 = undefined;
-    var writer = file.writer(&buf);
+    var writer = file.writer(io, &buf);
 
     var bin_count: usize = 0;
     var bin_it = bin_dir.iterate();
-    while (bin_it.next() catch |err| return reportError(
+    while (bin_it.next(io) catch |err| return reportError(
         "iterate zig-out/bin failed with {t}",
         .{err},
     )) |entry| {
         if (entry.kind != .file) continue;
         // PDB files are written as options on their .exe line
         if (std.ascii.endsWithIgnoreCase(entry.name, ".pdb")) continue;
-        const hash = hashFile(bin_dir, entry.name) catch |err|
+        const hash = hashFile(io, bin_dir, entry.name) catch |err|
             return reportError("hash zig-out/bin/{s} failed with {t}", .{ entry.name, err });
         writer.interface.print("bin/{s} {x}", .{ entry.name, hash }) catch return writer.err.?;
         if (builtin.os.tag == .windows and std.ascii.endsWithIgnoreCase(entry.name, ".exe")) {
@@ -1166,7 +1192,7 @@ fn writeManifest(scratch: *Scratch, manifest_path: []const u8, source_dir: std.f
             var pdb_name_buf: [std.fs.max_name_bytes]u8 = undefined;
             const pdb_name = std.fmt.bufPrint(&pdb_name_buf, "{s}.pdb", .{stem}) catch
                 errExit("binary name too long: '{s}'", .{entry.name});
-            if (hashFile(bin_dir, pdb_name)) |pdb_hash| {
+            if (hashFile(io, bin_dir, pdb_name)) |pdb_hash| {
                 writer.interface.print(" pdb={x}", .{pdb_hash}) catch return writer.err.?;
             } else |err| return reportError(
                 "hash zig-out/bin/{s} failed with {t}",
@@ -1181,7 +1207,7 @@ fn writeManifest(scratch: *Scratch, manifest_path: []const u8, source_dir: std.f
         errExit("zig build produced no binaries in zig-out/bin/", .{});
     }
 
-    manifest_dir.rename(tmp_name, manifest_name) catch |err|
+    manifest_dir.rename(tmp_name, manifest_dir, manifest_name, io) catch |err|
         return reportError("rename '{s}' to '{s}' failed with {t}", .{ tmp_name, manifest_name, err });
 }
 
@@ -1199,14 +1225,15 @@ fn installPkgPath(
 ) !void {
     const scratch_pos = scratch.position();
     defer scratch.restorePosition(scratch_pos);
+    const io = config.ctx.io;
 
-    var dir = std.fs.openDirAbsolute(path, .{}) catch |err| return reportError(
+    var dir = std.Io.Dir.openDirAbsolute(io, path, .{}) catch |err| return reportError(
         "open '{s}' failed with {t}",
         .{ path, err },
     );
-    defer dir.close();
+    defer dir.close(io);
 
-    dir.access("build.zig", .{}) catch |err| switch (err) {
+    dir.access(io, "build.zig", .{}) catch |err| switch (err) {
         error.FileNotFound => errExit("package at '{s}' has no build.zig", .{path}),
         else => return reportError(
             "access build.zig in '{s}' failed with {t}",
@@ -1220,29 +1247,30 @@ fn installPkgPath(
         anyzig_version,
     ) catch |e| oom(e);
     defer scratch.free(zig_path);
-    try ensureAnyzig(scratch, config.cache_path, zig_path);
+    try ensureAnyzig(scratch, config, zig_path);
 
-    var env_map = std.process.getEnvMap(scratch.allocator()) catch |err| switch (err) {
+    var environ_map = config.ctx.environ.createMap(scratch.allocator()) catch |err| switch (err) {
         error.OutOfMemory => |e| oom(e),
-        error.Unexpected => return reportError("get environment failed with {t}", .{err}),
+        else => |e| return reportError("get environment failed with {t}", .{e}),
     };
-    defer env_map.deinit();
+    defer environ_map.deinit();
     switch (revision) {
         .installed_from_path => {},
-        .revision => |r| env_map.put("HEW_BUILD_REVISION", r) catch |e| oom(e),
+        .revision => |r| environ_map.put("HEW_BUILD_REVISION", r) catch |e| oom(e),
     }
 
-    try runZigBuild(scratch, zig_path, path, dir, &env_map, .fetch);
-    try runZigBuild(scratch, zig_path, path, dir, &env_map, .build);
+    try runZigBuild(io, zig_path, path, dir, &environ_map, .fetch);
+    try runZigBuild(io, zig_path, path, dir, &environ_map, .build);
 
-    try writeManifest(scratch, manifest_path, dir);
+    try writeManifest(io, scratch, manifest_path, dir);
     std.log.info("wrote manifest to '{s}'", .{manifest_path});
 
     {
-        const manifest = try std.fs.cwd().readFileAlloc(
-            scratch.allocator(),
+        const manifest = try std.Io.Dir.cwd().readFileAlloc(
+            io,
             manifest_path,
-            std.math.maxInt(usize),
+            scratch.allocator(),
+            .unlimited,
         );
         defer scratch.freeLifo(manifest);
         var line_it = std.mem.tokenizeScalar(u8, manifest, '\n');
@@ -1253,30 +1281,30 @@ fn installPkgPath(
         }
     }
 
-    std.fs.makeDirAbsolute(config.bin_path) catch |err| switch (err) {
+    std.Io.Dir.createDirAbsolute(io, config.bin_path, .default_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return reportError("create '{s}' failed with {t}", .{ config.bin_path, err }),
     };
 
     // Copy executables from zig-out/bin/ to bin_path
-    var zig_out_bin = dir.openDir("zig-out/bin", .{ .iterate = true }) catch |err| switch (err) {
+    var zig_out_bin = dir.openDir(io, "zig-out/bin", .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => {
             log.warn("zig build produced no binaries in zig-out/bin/", .{});
             return;
         },
         else => return reportError("open zig-out/bin failed with {t}", .{err}),
     };
-    defer zig_out_bin.close();
+    defer zig_out_bin.close(io);
 
-    var dest_dir = std.fs.openDirAbsolute(config.bin_path, .{}) catch |err| return reportError(
+    var dest_dir = std.Io.Dir.openDirAbsolute(io, config.bin_path, .{}) catch |err| return reportError(
         "open '{s}' failed with {t}",
         .{ config.bin_path, err },
     );
-    defer dest_dir.close();
+    defer dest_dir.close(io);
 
     var it = zig_out_bin.iterate();
     var install_bin_count: usize = 0;
-    while (it.next() catch |err| return reportError(
+    while (it.next(io) catch |err| return reportError(
         "iterate zig-out/bin failed with {t}",
         .{err},
     )) |entry| {
@@ -1295,7 +1323,7 @@ fn installPkgPath(
         };
 
         if (!config.allow_overwrite) {
-            const exists: bool = if (dest_dir.access(entry.name, .{})) true else |err| switch (err) {
+            const exists: bool = if (dest_dir.access(io, entry.name, .{})) true else |err| switch (err) {
                 error.FileNotFound => false,
                 else => return reportError(
                     "access '{s}{c}{s}' failed with {t}",
@@ -1308,8 +1336,9 @@ fn installPkgPath(
                     .{ config.bin_path, std.fs.path.sep, entry.name },
                 );
                 var stderr_buf: [4096]u8 = undefined;
-                var stderr = std.fs.File.stderr().writer(&stderr_buf);
+                var stderr = std.Io.File.stderr().writer(io, &stderr_buf);
                 const overwrite = promptYesNo(
+                    io,
                     &stderr.interface,
                     "'{s}{c}{s}' already exists. Overwrite?",
                     .{ config.bin_path, std.fs.path.sep, entry.name },
@@ -1324,7 +1353,7 @@ fn installPkgPath(
             }
         }
 
-        copyOverwriteMaybeRunning(scratch, config.interactive, zig_out_bin, entry.name, dest_dir, config.bin_path, entry.name) catch |err| return reportError(
+        copyOverwriteMaybeRunning(io, scratch, config.ctx.tmp_dir, config.interactive, zig_out_bin, entry.name, dest_dir, config.bin_path, entry.name) catch |err| return reportError(
             "copy '{s}' to '{s}' failed with {t}",
             .{ entry.name, config.bin_path, err },
         );
@@ -1339,8 +1368,8 @@ fn installPkgPath(
                 "binary name too long: '{s}'",
                 .{entry.name},
             );
-            if (zig_out_bin.access(pdb_name, .{})) {
-                copyOverwriteMaybeRunning(scratch, config.interactive, zig_out_bin, pdb_name, dest_dir, config.bin_path, pdb_name) catch |err| return reportError(
+            if (zig_out_bin.access(io, pdb_name, .{})) {
+                copyOverwriteMaybeRunning(io, scratch, config.ctx.tmp_dir, config.interactive, zig_out_bin, pdb_name, dest_dir, config.bin_path, pdb_name) catch |err| return reportError(
                     "copy '{s}' to '{s}' failed with {t}",
                     .{ pdb_name, config.bin_path, err },
                 );
@@ -1348,7 +1377,7 @@ fn installPkgPath(
                 install_bin_count += 1;
             } else |_| {
                 // No pdb in source — delete stale pdb in dest if present
-                dest_dir.deleteFile(pdb_name) catch |err| switch (err) {
+                dest_dir.deleteFile(io, pdb_name) catch |err| switch (err) {
                     error.FileNotFound => {},
                     else => return reportError(
                         "delete '{s}{c}{s}' failed with {t}",
@@ -1368,7 +1397,7 @@ fn installPkgPath(
                 ) catch |e| oom(e);
                 defer scratch.freeLifo(expected);
                 var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-                var which_it = which.Iterator.fromEnv(&path_buf);
+                var which_it = which.Iterator.fromEnv(io, config.ctx.environ, &path_buf);
                 while (try which_it.next(entry.name)) |which_path| {
                     if (std.mem.eql(u8, which_path, expected))
                         break;
@@ -1395,16 +1424,18 @@ fn installPkgPath(
 // target is our own running executable, try to rename it out of the way
 // automatically (TMPDIR first, then same-dir); otherwise prompt the user.
 fn copyOverwriteMaybeRunning(
+    io: std.Io,
     scratch: *Scratch,
+    tmp_dir: []const u8,
     interactive: bool,
-    src_dir: std.fs.Dir,
+    src_dir: std.Io.Dir,
     src_name: []const u8,
-    dest_dir: std.fs.Dir,
+    dest_dir: std.Io.Dir,
     dest_dir_path: []const u8,
     dest_name: []const u8,
 ) !void {
     while (true) {
-        src_dir.copyFile(src_name, dest_dir, dest_name, .{}) catch |err| switch (err) {
+        src_dir.copyFile(src_name, dest_dir, dest_name, io, .{}) catch |err| switch (err) {
             error.AccessDenied => |copy_file_error| if (builtin.os.tag != .windows) return err else {
                 const scratch_pos = scratch.position();
                 defer scratch.restorePosition(scratch_pos);
@@ -1413,18 +1444,18 @@ fn copyOverwriteMaybeRunning(
                     "{s}{c}{s}",
                     .{ dest_dir_path, std.fs.path.sep, dest_name },
                 ) catch |e| oom(e);
-                if (try isSelfExe(abs_dest_path)) {
-                    if (try tryRenameOutOfWay(scratch, dest_dir, abs_dest_path, dest_dir_path, dest_name)) continue;
+                if (try isSelfExe(io, abs_dest_path)) {
+                    if (try tryRenameOutOfWay(io, scratch, tmp_dir, dest_dir, abs_dest_path, dest_dir_path, dest_name)) continue;
                     // Auto-fallback exhausted; fall through to prompt.
                 }
                 if (!interactive) return copy_file_error;
-                switch (try promptRunningFileConflict(dest_dir_path, dest_name)) {
+                switch (try promptRunningFileConflict(io, dest_dir_path, dest_name)) {
                     .cancel => errExit("install cancelled", .{}),
                     .rename => {
                         var backup_buf: [std.fs.max_name_bytes]u8 = undefined;
                         const backup_name = std.fmt.bufPrint(&backup_buf, "{s}.deleteme", .{dest_name}) catch
                             errExit("name too long: '{s}.deleteme'", .{dest_name});
-                        dest_dir.deleteFile(backup_name) catch |e| switch (e) {
+                        dest_dir.deleteFile(io, backup_name) catch |e| switch (e) {
                             error.FileNotFound => {},
                             error.AccessDenied => {
                                 log.err("delete existing '{s}{c}{s}' failed with {t}", .{ dest_dir_path, std.fs.path.sep, backup_name, e });
@@ -1432,7 +1463,7 @@ fn copyOverwriteMaybeRunning(
                             },
                             else => return e,
                         };
-                        renameMaybeRunning(dest_dir, dest_name, dest_dir, backup_name) catch |e| switch (e) {
+                        renameMaybeRunning(io, dest_dir, dest_name, dest_dir, backup_name) catch |e| switch (e) {
                             error.AccessDenied,
                             error.SharingViolation,
                             error.DeletePending,
@@ -1453,18 +1484,18 @@ fn copyOverwriteMaybeRunning(
     }
 }
 
-fn isSelfExe(abs_target_path: []const u8) !bool {
+fn isSelfExe(io: std.Io, abs_target_path: []const u8) !bool {
     var self_raw_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const self_raw = try std.fs.selfExePath(&self_raw_buf);
+    const self_raw = self_raw_buf[0..try std.process.executablePath(io, &self_raw_buf)];
     var self_real_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const self_real = try std.posix.realpath(self_raw, &self_real_buf);
+    const self_real = self_real_buf[0..try std.Io.Dir.realPathFileAbsolute(io, self_raw, &self_real_buf)];
 
     var target_real_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const target_real = std.posix.realpath(abs_target_path, &target_real_buf) catch |err| switch (err) {
+    const target_real = target_real_buf[0 .. std.Io.Dir.realPathFileAbsolute(io, abs_target_path, &target_real_buf) catch |err| switch (err) {
         // Target vanished between copy attempt and now — definitely not us.
         error.FileNotFound => return false,
         else => |e| return e,
-    };
+    }];
 
     if (builtin.os.tag == .windows) return std.ascii.eqlIgnoreCase(self_real, target_real);
     return std.mem.eql(u8, self_real, target_real);
@@ -1475,43 +1506,59 @@ fn isSelfExe(abs_target_path: []const u8) !bool {
 // fine because it opens the source needing only DELETE access — so do the same:
 // open with DELETE, then NtSetInformationFile with FileRenameInformation.
 fn renameMaybeRunning(
-    old_dir: std.fs.Dir,
+    io: std.Io,
+    old_dir: std.Io.Dir,
     old_name: []const u8,
-    new_dir: std.fs.Dir,
+    new_dir: std.Io.Dir,
     new_name: []const u8,
 ) !void {
-    if (builtin.os.tag != .windows) return std.fs.rename(old_dir, old_name, new_dir, new_name);
+    if (builtin.os.tag != .windows) return old_dir.rename(old_name, new_dir, new_name, io);
 
     const w = std.os.windows;
-    const old_path = try w.sliceToPrefixedFileW(old_dir.fd, old_name);
-    const new_path = try w.sliceToPrefixedFileW(new_dir.fd, new_name);
+    const old_path = try std.Io.Threaded.sliceToPrefixedFileW(old_dir.handle, old_name, .{});
+    const new_path = try std.Io.Threaded.sliceToPrefixedFileW(new_dir.handle, new_name, .{});
+    const old_w = old_path.span();
     const new_w = new_path.span();
 
-    const src_fd = try w.OpenFile(old_path.span(), .{
-        .dir = old_dir.fd,
-        .access_mask = w.SYNCHRONIZE | w.DELETE,
-        .creation = w.FILE_OPEN,
-        .filter = .any,
-        .follow_symlinks = false,
-    });
+    // std.Io.Threaded has the same NtCreateFile call (OpenFile) but it's private.
+    var src_fd: w.HANDLE = undefined;
+    var create_io_status: w.IO_STATUS_BLOCK = undefined;
+    switch (w.ntdll.NtCreateFile(
+        &src_fd,
+        .{ .STANDARD = .{ .RIGHTS = .{ .DELETE = true }, .SYNCHRONIZE = true } },
+        &.{
+            .RootDirectory = if (std.fs.path.isAbsoluteWindowsWtf16(old_w)) null else old_dir.handle,
+            .Attributes = .{},
+            .ObjectName = @constCast(&w.UNICODE_STRING.init(old_w)),
+            .SecurityDescriptor = null,
+        },
+        &create_io_status,
+        null,
+        .{ .NORMAL = true },
+        .VALID_FLAGS,
+        .OPEN,
+        .{ .IO = .SYNCHRONOUS_NONALERT, .OPEN_REPARSE_POINT = true },
+        null,
+        0,
+    )) {
+        .SUCCESS => {},
+        .ACCESS_DENIED => return error.AccessDenied,
+        .SHARING_VIOLATION => return error.SharingViolation,
+        .DELETE_PENDING => return error.DeletePending,
+        .OBJECT_NAME_NOT_FOUND => return error.FileNotFound,
+        .OBJECT_PATH_NOT_FOUND => return error.FileNotFound,
+        else => |rc| return unexpectedNtstatus("NtCreateFile", rc),
+    }
     defer w.CloseHandle(src_fd);
 
-    const struct_buf_len = @sizeOf(w.FILE_RENAME_INFORMATION) + (std.fs.max_path_bytes - 1);
-    var rename_info_buf: [struct_buf_len]u8 align(@alignOf(w.FILE_RENAME_INFORMATION)) = undefined;
-    const struct_len = @sizeOf(w.FILE_RENAME_INFORMATION) - 1 + new_w.len * 2;
-    if (struct_len > struct_buf_len) return error.NameTooLong;
-
-    const rename_info: *w.FILE_RENAME_INFORMATION = @ptrCast(&rename_info_buf);
-    rename_info.* = .{
-        .Flags = w.TRUE, // replace an existing target, matching std.fs.rename
-        .RootDirectory = if (std.fs.path.isAbsoluteWindowsWTF16(new_w)) null else new_dir.fd,
-        .FileNameLength = @intCast(new_w.len * 2),
-        .FileName = undefined,
-    };
-    @memcpy((&rename_info.FileName).ptr, new_w);
-
-    var io: w.IO_STATUS_BLOCK = undefined;
-    switch (w.ntdll.NtSetInformationFile(src_fd, &io, rename_info, @intCast(struct_len), .FileRenameInformation)) {
+    var rename_info: w.FILE.RENAME_INFORMATION = .init(.{
+        .Flags = .{ .REPLACE_IF_EXISTS = true }, // matching std.Io.Dir.rename
+        .RootDirectory = if (std.fs.path.isAbsoluteWindowsWtf16(new_w)) null else new_dir.handle,
+        .FileName = new_w,
+    });
+    const rename_info_buf = rename_info.toBuffer();
+    var io_status: w.IO_STATUS_BLOCK = undefined;
+    switch (w.ntdll.NtSetInformationFile(src_fd, &io_status, rename_info_buf.ptr, @intCast(rename_info_buf.len), .Rename)) {
         .SUCCESS => {},
         .INVALID_HANDLE => unreachable,
         .INVALID_PARAMETER => unreachable,
@@ -1521,36 +1568,44 @@ fn renameMaybeRunning(
         .DELETE_PENDING => return error.DeletePending,
         .OBJECT_NAME_NOT_FOUND => return error.FileNotFound,
         .OBJECT_PATH_NOT_FOUND => return error.FileNotFound,
-        .NOT_SAME_DEVICE => return error.RenameAcrossMountPoints,
+        .NOT_SAME_DEVICE => return error.CrossDevice,
         .OBJECT_NAME_COLLISION => return error.PathAlreadyExists,
-        else => |rc| return w.unexpectedStatus(rc),
+        else => |rc| return unexpectedNtstatus("NtSetInformationFile(Rename)", rc),
     }
+}
+
+/// Logs an unexpected NTSTATUS as a number. Never print a windows error code as
+/// a tag name: that links in the names of every code.
+fn unexpectedNtstatus(what: []const u8, status: std.os.windows.NTSTATUS) error{Unexpected} {
+    log.err("{s} failed, NTSTATUS 0x{x}", .{ what, @backingInt(status) });
+    return error.Unexpected;
 }
 
 /// Try TMPDIR rename, then same-dir `.deleteme` rename. Returns true if the
 /// file was moved out of the way (caller should retry the copy).
 fn tryRenameOutOfWay(
+    io: std.Io,
     scratch: *Scratch,
-    dest_dir: std.fs.Dir,
+    tmp_dir_path: []const u8,
+    dest_dir: std.Io.Dir,
     abs_src_path: []const u8,
     dest_dir_path: []const u8,
     dest_name: []const u8,
 ) !bool {
-    const tmp_path = allocTmpPath(scratch.allocator(), "hew-{s}.deleteme", .{dest_name});
-    const tmp_dir_path = std.fs.path.dirname(tmp_path).?;
+    const tmp_path = allocTmpPath(scratch.allocator(), tmp_dir_path, "hew-{s}.deleteme", .{dest_name});
     const tmp_name = std.fs.path.basename(tmp_path);
-    if (std.fs.openDirAbsolute(tmp_dir_path, .{})) |opened| {
+    if (std.Io.Dir.openDirAbsolute(io, tmp_dir_path, .{})) |opened| {
         var tmp_dir = opened;
-        defer tmp_dir.close();
-        tmp_dir.deleteFile(tmp_name) catch |err| switch (err) {
+        defer tmp_dir.close(io);
+        tmp_dir.deleteFile(io, tmp_name) catch |err| switch (err) {
             error.FileNotFound => {},
             else => {}, // stale copy still locked; rename below will replace it or fail
         };
-        if (renameMaybeRunning(dest_dir, dest_name, tmp_dir, tmp_name)) {
+        if (renameMaybeRunning(io, dest_dir, dest_name, tmp_dir, tmp_name)) {
             log.info("renamed '{s}' to '{s}'", .{ abs_src_path, tmp_path });
             return true;
         } else |err| switch (err) {
-            error.RenameAcrossMountPoints => {}, // fall through to same-dir
+            error.CrossDevice => {}, // fall through to same-dir
             else => return err,
         }
     } else |_| {} // can't open TMPDIR; fall through to same-dir
@@ -1558,20 +1613,20 @@ fn tryRenameOutOfWay(
     var backup_buf: [std.fs.max_name_bytes]u8 = undefined;
     const backup_name = std.fmt.bufPrint(&backup_buf, "{s}.deleteme", .{dest_name}) catch
         errExit("name too long: '{s}.deleteme'", .{dest_name});
-    dest_dir.deleteFile(backup_name) catch |err| switch (err) {
+    dest_dir.deleteFile(io, backup_name) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return false, // existing backup can't be cleared; let prompt handle it
     };
-    renameMaybeRunning(dest_dir, dest_name, dest_dir, backup_name) catch return false;
+    renameMaybeRunning(io, dest_dir, dest_name, dest_dir, backup_name) catch return false;
     log.info("renamed '{s}' to '{s}{c}{s}'", .{ abs_src_path, dest_dir_path, std.fs.path.sep, backup_name });
     return true;
 }
 
 const RunningFileChoice = enum { cancel, rename, retry };
 
-fn promptRunningFileConflict(dest_dir_path: []const u8, dest_name: []const u8) !RunningFileChoice {
+fn promptRunningFileConflict(io: std.Io, dest_dir_path: []const u8, dest_name: []const u8) !RunningFileChoice {
     var stderr_buf: [4096]u8 = undefined;
-    var stderr = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr = std.Io.File.stderr().writer(io, &stderr_buf);
     const w = &stderr.interface;
     w.print(
         \\'{s}{c}{s}' cannot be overwritten (file is in use, e.g. a running executable).
@@ -1582,7 +1637,7 @@ fn promptRunningFileConflict(dest_dir_path: []const u8, dest_name: []const u8) !
     , .{ dest_dir_path, std.fs.path.sep, dest_name, dest_name }) catch |err| switch (err) {
         error.WriteFailed => return stderr.err.?,
     };
-    const choice = promptNumber(w, "choose", 2) catch |err| switch (err) {
+    const choice = promptNumber(io, w, "choose", 2) catch |err| switch (err) {
         error.WriteFailed => return stderr.err.?,
         else => |e| return e,
     };
@@ -1666,114 +1721,110 @@ fn gitHostFromUrl(url: []const u8) ?GitHost {
     return null;
 }
 
-var github_auth_logged: std.atomic.Value(bool) = .init(false);
-var gitlab_auth_logged: std.atomic.Value(bool) = .init(false);
-var codeberg_auth_logged: std.atomic.Value(bool) = .init(false);
+/// The environment variables that hold each git host's API token, in priority order.
+const token_env_names: std.enums.EnumArray(GitHost, [2][]const u8) = .init(.{
+    .github = .{ "GH_TOKEN", "GITHUB_TOKEN" },
+    .gitlab = .{ "GITLAB_TOKEN", "GL_TOKEN" },
+    .codeberg = .{ "CB_TOKEN", "CODEBERG_TOKEN" },
+});
 
-fn gitAuthHeader(buf: *[github_auth_buf_len]u8, url: []const u8) std.http.Client.Request.Headers.Value {
-    switch (gitHostFromUrl(url) orelse return .default) {
-        .github => {
-            const dest = buf[bearer_prefix.len..];
-            const token_len, const env_name = if (builtin.os.tag == .windows) blk: {
-                if (getEnvWindows(L("GH_TOKEN"), dest)) |len| break :blk .{ len, "GH_TOKEN" };
-                if (getEnvWindows(L("GITHUB_TOKEN"), dest)) |len| break :blk .{ len, "GITHUB_TOKEN" };
-                break :blk .{ @as(usize, 0), @as([]const u8, "none") };
-            } else blk: {
-                if (std.posix.getenv("GH_TOKEN")) |token| {
-                    if (token.len > dest.len) errExit("GH_TOKEN too long (cannot exceed {d} but is {d})", .{ dest.len, token.len });
-                    @memcpy(dest[0..token.len], token);
-                    break :blk .{ token.len, "GH_TOKEN" };
+/// The API tokens for git hosts (see token_env_names). Derive once with init and
+/// pass to whatever makes requests. On windows the tokens are void so we never
+/// cache a pointer into the process environment block, which moves when any
+/// variable is modified; read reads the variables when called instead.
+const GitAuth = struct {
+    tokens: switch (builtin.os.tag) {
+        .windows => void,
+        else => std.enums.EnumArray(GitHost, ?Token),
+    },
+    /// Hosts whose token source has been logged.
+    logged: std.enums.EnumSet(GitHost) = .empty,
+
+    const Token = struct {
+        env_name: []const u8,
+        value: []const u8,
+    };
+
+    pub fn init(environ: std.process.Environ) GitAuth {
+        if (builtin.os.tag == .windows) return .{ .tokens = {} };
+        var tokens: std.enums.EnumArray(GitHost, ?Token) = .initFill(null);
+        for (std.enums.values(GitHost)) |host| {
+            for (token_env_names.get(host)) |env_name| {
+                if (environ.getPosix(env_name)) |value| {
+                    tokens.set(host, .{ .env_name = env_name, .value = value });
+                    break;
                 }
-                if (std.posix.getenv("GITHUB_TOKEN")) |token| {
-                    if (token.len > dest.len) errExit("GITHUB_TOKEN too long (cannot exceed {d} but is {d})", .{ dest.len, token.len });
-                    @memcpy(dest[0..token.len], token);
-                    break :blk .{ token.len, "GITHUB_TOKEN" };
-                }
-                break :blk .{ @as(usize, 0), @as([]const u8, "none") };
-            };
-            if (!github_auth_logged.swap(true, .monotonic))
-                log.info("github auth: {s}", .{env_name});
-            if (token_len == 0) return .default;
-            @memcpy(buf[0..bearer_prefix.len], bearer_prefix);
-            return .{ .override = buf[0 .. bearer_prefix.len + token_len] };
-        },
-        .gitlab => {
-            const dest = buf[bearer_prefix.len..];
-            const token_len, const env_name = if (builtin.os.tag == .windows) blk: {
-                if (getEnvWindows(L("GITLAB_TOKEN"), dest)) |len| break :blk .{ len, "GITLAB_TOKEN" };
-                if (getEnvWindows(L("GL_TOKEN"), dest)) |len| break :blk .{ len, "GL_TOKEN" };
-                break :blk .{ @as(usize, 0), @as([]const u8, "none") };
-            } else blk: {
-                if (std.posix.getenv("GITLAB_TOKEN")) |token| {
-                    if (token.len > dest.len) errExit("GITLAB_TOKEN too long (cannot exceed {d} but is {d})", .{ dest.len, token.len });
-                    @memcpy(dest[0..token.len], token);
-                    break :blk .{ token.len, "GITLAB_TOKEN" };
-                }
-                if (std.posix.getenv("GL_TOKEN")) |token| {
-                    if (token.len > dest.len) errExit("GL_TOKEN too long (cannot exceed {d} but is {d})", .{ dest.len, token.len });
-                    @memcpy(dest[0..token.len], token);
-                    break :blk .{ token.len, "GL_TOKEN" };
-                }
-                break :blk .{ @as(usize, 0), @as([]const u8, "none") };
-            };
-            if (!gitlab_auth_logged.swap(true, .monotonic))
-                log.info("gitlab auth: {s}", .{env_name});
-            if (token_len == 0) return .default;
-            @memcpy(buf[0..bearer_prefix.len], bearer_prefix);
-            return .{ .override = buf[0 .. bearer_prefix.len + token_len] };
-        },
-        .codeberg => {
-            const dest = buf[bearer_prefix.len..];
-            const token_len, const env_name = if (builtin.os.tag == .windows) blk: {
-                if (getEnvWindows(L("CB_TOKEN"), dest)) |len| break :blk .{ len, "CB_TOKEN" };
-                if (getEnvWindows(L("CODEBERG_TOKEN"), dest)) |len| break :blk .{ len, "CODEBERG_TOKEN" };
-                break :blk .{ @as(usize, 0), @as([]const u8, "none") };
-            } else blk: {
-                if (std.posix.getenv("CB_TOKEN")) |token| {
-                    if (token.len > dest.len) errExit("CB_TOKEN too long", .{});
-                    @memcpy(dest[0..token.len], token);
-                    break :blk .{ token.len, "CB_TOKEN" };
-                }
-                if (std.posix.getenv("CODEBERG_TOKEN")) |token| {
-                    if (token.len > dest.len) errExit("CODEBERG_TOKEN too long", .{});
-                    @memcpy(dest[0..token.len], token);
-                    break :blk .{ token.len, "CODEBERG_TOKEN" };
-                }
-                break :blk .{ @as(usize, 0), @as([]const u8, "none") };
-            };
-            if (!codeberg_auth_logged.swap(true, .monotonic))
-                log.info("codeberg auth: {s}", .{env_name});
-            if (token_len == 0) return .default;
-            @memcpy(buf[0..bearer_prefix.len], bearer_prefix);
-            return .{ .override = buf[0 .. bearer_prefix.len + token_len] };
-        },
+            }
+        }
+        return .{ .tokens = tokens };
     }
+
+    /// Copies the token for `host` into `buf` (as WTF-8 on windows). Returns the
+    /// name of the variable it came from and its length, or null if none are set.
+    fn read(auth: *const GitAuth, host: GitHost, buf: []u8) ?struct { []const u8, usize } {
+        if (builtin.os.tag == .windows) {
+            const environ: std.process.Environ = .{ .block = .global };
+            switch (host) {
+                inline else => |h| inline for (comptime token_env_names.get(h)) |env_name| {
+                    if (environ.getWindows(std.unicode.wtf8ToWtf16LeStringLiteral(env_name))) |value| {
+                        const len = std.unicode.calcWtf8Len(value);
+                        if (len > buf.len) errExit("{s} too long (cannot exceed {d} but is {d})", .{ env_name, buf.len, len });
+                        return .{ env_name, std.unicode.wtf16LeToWtf8(buf, value) };
+                    }
+                },
+            }
+            return null;
+        }
+        const token = auth.tokens.get(host) orelse return null;
+        if (token.value.len > buf.len) errExit("{s} too long (cannot exceed {d} but is {d})", .{ token.env_name, buf.len, token.value.len });
+        @memcpy(buf[0..token.value.len], token.value);
+        return .{ token.env_name, token.value.len };
+    }
+};
+
+fn gitAuthHeader(git_auth: *GitAuth, buf: *[github_auth_buf_len]u8, url: []const u8) std.http.Client.Request.Headers.Value {
+    const host = gitHostFromUrl(url) orelse return .default;
+    const env_name, const token_len = git_auth.read(host, buf[bearer_prefix.len..]) orelse .{ "none", 0 };
+    if (!git_auth.logged.contains(host)) {
+        git_auth.logged.insert(host);
+        log.info("{t} auth: {s}", .{ host, env_name });
+    }
+    if (token_len == 0) return .default;
+    @memcpy(buf[0..bearer_prefix.len], bearer_prefix);
+    return .{ .override = buf[0 .. bearer_prefix.len + token_len] };
 }
+
+/// What's needed to make HTTP requests to git hosts.
+const Http = struct {
+    ctx: *const ProcessEnv,
+    client: *std.http.Client,
+    git_auth: *GitAuth,
+};
 
 const FetchResult = struct {
     status: std.http.Status,
-    body: std.ArrayListUnmanaged(u8),
+    body: std.ArrayList(u8),
 };
 
-fn fetchGitJson(url: []const u8, client: *std.http.Client, allocator: std.mem.Allocator) FetchResult {
+fn fetchGitJson(url: []const u8, http: Http, allocator: std.mem.Allocator) FetchResult {
     var github_auth_buf: [github_auth_buf_len]u8 = undefined;
 
     var attempt_counter: u8 = 0;
     while (true) : (attempt_counter += 1) {
         var response_body: std.Io.Writer.Allocating = .init(allocator);
         defer response_body.deinit();
-        const result = client.fetch(.{
+        const result = http.client.fetch(.{
             .location = .{ .url = url },
             .headers = .{
                 .user_agent = .{ .override = "hew/0.0.1" },
-                .authorization = gitAuthHeader(&github_auth_buf, url),
+                .authorization = gitAuthHeader(http.git_auth, &github_auth_buf, url),
             },
             .response_writer = &response_body.writer,
         }) catch |err| {
             errExit("fetch '{s}' failed with {t}", .{ url, err });
         };
         if (result.status == .too_many_requests and attempt_counter < rate_limit_retries) {
-            retryAfterRateLimit(url, attempt_counter);
+            retryAfterRateLimit(http.ctx.io, url, attempt_counter);
             continue;
         }
         return .{ .status = result.status, .body = response_body.toArrayList() };
@@ -1781,17 +1832,19 @@ fn fetchGitJson(url: []const u8, client: *std.http.Client, allocator: std.mem.Al
 }
 
 const rate_limit_retries = 3;
-const rate_limit_delays_s = [rate_limit_retries]u64{ 5, 30, 60 };
+const rate_limit_delays_s = [rate_limit_retries]i64{ 5, 30, 60 };
 
-fn retryAfterRateLimit(url: []const u8, attempt_counter: u8) void {
+fn retryAfterRateLimit(io: std.Io, url: []const u8, attempt_counter: u8) void {
     const delay_s = rate_limit_delays_s[attempt_counter];
     log.warn("GET {s} returned 429 Too Many Requests, retrying in {d} seconds...", .{ url, delay_s });
-    std.Thread.sleep(delay_s * std.time.ns_per_s);
+    io.sleep(.fromSeconds(delay_s), .awake) catch |err| switch (err) {
+        error.Canceled => errExit("canceled while waiting to retry GET {s}", .{url}),
+    };
 }
 
 fn fetchErrExit(url: []const u8, result: FetchResult) noreturn {
     if (result.body.items.len > 0) {
-        const dashes = "-" ** 40;
+        const dashes = "----------------------------------------";
         log.err("GET {s} returned status {d} and the following {d}-byte response:\n" ++ dashes ++ "\n{s}\n" ++ dashes, .{ url, @intFromEnum(result.status), result.body.items.len, result.body.items });
     } else {
         log.err("GET {s} returned status {d} with no response body", .{ url, @intFromEnum(result.status) });
@@ -1849,16 +1902,18 @@ fn getLineCol(text: []const u8, offset: usize) struct { usize, usize } {
 
 fn jsonErrorExit(
     scratch: *Scratch,
+    ctx: *const ProcessEnv,
     url: []const u8,
     json_content: []const u8,
     err: *const ParseJsonError,
 ) noreturn {
-    reportJsonError(scratch, url, json_content, err);
+    reportJsonError(scratch, ctx, url, json_content, err);
     std.process.exit(0xff);
 }
 
 fn reportJsonError(
     scratch: *Scratch,
+    ctx: *const ProcessEnv,
     url: []const u8,
     json_content: []const u8,
     err: *const ParseJsonError,
@@ -1870,7 +1925,7 @@ fn reportJsonError(
 
     const url_path = if (std.mem.indexOf(u8, url, "://")) |i| url[i + 3 ..] else url;
     const ext = ".json";
-    const tmp_path = allocTmpPath(scratch.allocator(), "hew-{s}{s}", .{ url_path, ext });
+    const tmp_path = allocTmpPath(scratch.allocator(), ctx.tmp_dir, "hew-{s}{s}", .{ url_path, ext });
     defer scratch.freeLifo(tmp_path);
 
     const name_start = tmp_path.len - ext.len - url_path.len;
@@ -1883,7 +1938,7 @@ fn reportJsonError(
 
     const saved = blk: {
         if (std.fs.path.dirname(tmp_path)) |dir| {
-            std.fs.cwd().makePath(dir) catch |create_dir_error| {
+            std.Io.Dir.cwd().createDirPath(ctx.io, dir) catch |create_dir_error| {
                 log.warn(
                     "create dir '{s}' (to save JSON response) failed with {t}",
                     .{ dir, create_dir_error },
@@ -1891,12 +1946,12 @@ fn reportJsonError(
                 break :blk false;
             };
         }
-        const f = std.fs.createFileAbsolute(tmp_path, .{}) catch |save_err| {
+        const f = std.Io.Dir.createFileAbsolute(ctx.io, tmp_path, .{}) catch |save_err| {
             log.warn("save JSON to '{s}' failed with {t}", .{ tmp_path, save_err });
             break :blk false;
         };
-        defer f.close();
-        f.writeAll(json_content) catch |save_err| {
+        defer f.close(ctx.io);
+        f.writeStreamingAll(ctx.io, json_content) catch |save_err| {
             log.warn("write JSON to '{s}' failed with {t}", .{ tmp_path, save_err });
             break :blk false;
         };
@@ -1906,8 +1961,8 @@ fn reportJsonError(
     const file_path: []const u8 = if (saved) tmp_path else "";
     const file_sep: []const u8 = if (saved) ":" else "";
     var buffer: [200]u8 = undefined;
-    const stderr = std.debug.lockStderrWriter(&buffer);
-    defer std.debug.unlockStderrWriter();
+    const stderr = &std.debug.lockStderr(&buffer).file_writer.interface;
+    defer std.debug.unlockStderr();
     stderr.print("{s}{s}{f}\n", .{ file_path, file_sep, err.fmt(json_content) }) catch @panic("print to stderr failed");
 }
 
@@ -2153,7 +2208,8 @@ fn parseSha(text: []const u8, err: *ParseJsonError, field_name: [:0]const u8) er
     return err.set(0, .{ .missing_field = field_name });
 }
 
-fn downloadToCache(scratch: *Scratch, client: *std.http.Client, url: []const u8, pkg_cache_path: []const u8) error{Reported}!void {
+fn downloadToCache(scratch: *Scratch, http: Http, url: []const u8, pkg_cache_path: []const u8) error{Reported}!void {
+    const io = http.ctx.io;
     const lock_path = std.fmt.allocPrint(
         scratch.allocator(),
         "{s}.lock",
@@ -2161,13 +2217,13 @@ fn downloadToCache(scratch: *Scratch, client: *std.http.Client, url: []const u8,
     ) catch |e| oom(e);
     defer scratch.free(lock_path);
 
-    var lock_file = LockFile.lock(lock_path) catch |err| return reportError(
+    var lock_file = LockFile.lock(io, lock_path) catch |err| return reportError(
         "lock '{s}' failed with {t}",
         .{ lock_path, err },
     );
-    defer lock_file.unlock();
+    defer lock_file.unlock(io);
 
-    const cached: bool = if (std.fs.accessAbsolute(pkg_cache_path, .{})) true else |err| switch (err) {
+    const cached: bool = if (std.Io.Dir.accessAbsolute(io, pkg_cache_path, .{})) true else |err| switch (err) {
         error.FileNotFound => false,
         else => return reportError("access '{s}' failed with {t}", .{ pkg_cache_path, err }),
     };
@@ -2182,24 +2238,25 @@ fn downloadToCache(scratch: *Scratch, client: *std.http.Client, url: []const u8,
         ) catch |e| oom(e);
         defer scratch.free(downloading_path);
 
-        errdefer std.fs.deleteFileAbsolute(downloading_path) catch |err| switch (err) {
+        errdefer std.Io.Dir.deleteFileAbsolute(io, downloading_path) catch |err| switch (err) {
             error.FileNotFound => {},
             else => log.warn("clean up '{s}' failed with {t}", .{ downloading_path, err }),
         };
         {
-            const download_file = std.fs.createFileAbsolute(downloading_path, .{}) catch |err| return reportError(
+            const download_file = std.Io.Dir.createFileAbsolute(io, downloading_path, .{}) catch |err| return reportError(
                 "create '{s}' failed with {t}",
                 .{ downloading_path, err },
             );
-            defer download_file.close();
+            var download_file_open = true;
+            defer if (download_file_open) download_file.close(io);
             var download_buf: [4096]u8 = undefined;
-            var file_writer = download_file.writer(&download_buf);
+            var file_writer = download_file.writer(io, &download_buf);
             var auth_buf: [github_auth_buf_len]u8 = undefined;
-            const result = client.fetch(.{
+            const result = http.client.fetch(.{
                 .location = .{ .url = url },
                 .headers = .{
                     .user_agent = .{ .override = "hew/0.0.1" },
-                    .authorization = gitAuthHeader(&auth_buf, url),
+                    .authorization = gitAuthHeader(http.git_auth, &auth_buf, url),
                 },
                 .response_writer = &file_writer.interface,
             }) catch |err| switch (err) {
@@ -2214,19 +2271,18 @@ fn downloadToCache(scratch: *Scratch, client: *std.http.Client, url: []const u8,
                 .{ downloading_path, file_writer.err.? },
             );
             if (result.status != .ok) {
-                download_file.close();
-                const body: ?[]const u8 = blk: {
-                    const f = std.fs.openFileAbsolute(downloading_path, .{}) catch |err| {
-                        log.warn("failed to open error response file '{s}': {t}", .{ downloading_path, err });
-                        break :blk null;
-                    };
-                    defer f.close();
-                    break :blk f.readToEndAlloc(scratch.allocator(), 100 * 1024 * 1024) catch |err| {
-                        log.warn("failed to read error response file '{s}': {t}", .{ downloading_path, err });
-                        break :blk null;
-                    };
+                download_file.close(io);
+                download_file_open = false;
+                const body: ?[]const u8 = std.Io.Dir.cwd().readFileAlloc(
+                    io,
+                    downloading_path,
+                    scratch.allocator(),
+                    .limited(100 * 1024 * 1024),
+                ) catch |err| blk: {
+                    log.warn("failed to read error response file '{s}': {t}", .{ downloading_path, err });
+                    break :blk null;
                 };
-                const dashes = "-" ** 40;
+                const dashes = "----------------------------------------";
                 if (body) |b| {
                     log.err("GET {s} returned status {d} and the following {d}-byte response:\n" ++ dashes ++ "\n{s}\n" ++ dashes, .{ url, @intFromEnum(result.status), b.len, b });
                 } else {
@@ -2236,7 +2292,7 @@ fn downloadToCache(scratch: *Scratch, client: *std.http.Client, url: []const u8,
             }
         }
 
-        std.fs.renameAbsolute(downloading_path, pkg_cache_path) catch |err| return reportError(
+        std.Io.Dir.renameAbsolute(downloading_path, pkg_cache_path, io) catch |err| return reportError(
             "rename '{s}' to '{s}' failed with {t}",
             .{ downloading_path, pkg_cache_path, err },
         );
@@ -2244,106 +2300,295 @@ fn downloadToCache(scratch: *Scratch, client: *std.http.Client, url: []const u8,
     }
 }
 
-fn allocTmpPath(allocator: std.mem.Allocator, comptime sub_path_fmt: []const u8, sub_path_args: anytype) []u8 {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const prefix_len = blk: {
-        if (builtin.os.tag == .windows) {
-            if (getEnvWindows(L("TEMP"), &buf)) |len| break :blk len;
-            if (getEnvWindows(L("TMP"), &buf)) |len| break :blk len;
-        }
-
-        const str = if (builtin.os.tag == .windows) "C:\\Windows\\Temp" else (std.posix.getenv("TMPDIR") orelse "/tmp");
-        if (str.len > buf.len) std.debug.panic("TMPDIR environment variable too long (cannot exceed {d})", .{buf.len});
-        @memcpy(buf[0..str.len], str);
-        break :blk str.len;
-    };
-    const trimmed = blk: {
-        var trimmed = prefix_len;
-        while (trimmed > 0 and std.fs.path.isSep(buf[trimmed - 1])) {
-            trimmed -= 1;
-        }
-        break :blk trimmed;
-    };
-    var fbs: std.io.FixedBufferStream([]u8) = .{ .buffer = &buf, .pos = trimmed };
-    const writer = fbs.writer();
-    writer.print(std.fs.path.sep_str ++ sub_path_fmt, sub_path_args) catch @panic("tmp path too long");
-    return allocator.dupe(u8, fbs.getWritten()) catch |e| oom(e);
+fn allocTmpPath(allocator: std.mem.Allocator, tmp_dir: []const u8, comptime sub_path_fmt: []const u8, sub_path_args: anytype) []u8 {
+    return std.fmt.allocPrint(allocator, "{s}" ++ std.fs.path.sep_str ++ sub_path_fmt, .{tmp_dir} ++ sub_path_args) catch |e| oom(e);
 }
 
-fn getEnvWindows(comptime key: [:0]const u16, buf: []u8) ?usize {
-    const value_w = std.process.getenvW(key) orelse return null;
-    const required = std.unicode.calcWtf8Len(value_w);
-    if (required > buf.len) std.debug.panic(
-        "environment variable '{f}' too long (cannot exceed {d} but is {d})",
-        .{ std.unicode.fmtUtf16Le(key), buf.len, required },
-    );
-    return std.unicode.wtf16LeToWtf8(buf, value_w);
+/// Returns the directory for temporary files with any trailing separators removed.
+fn allocTmpDir(allocator: std.mem.Allocator, environ: std.process.Environ) []const u8 {
+    const dir = if (builtin.os.tag == .windows)
+        getEnv(allocator, environ, "TEMP") orelse getEnv(allocator, environ, "TMP") orelse "C:\\Windows\\Temp"
+    else
+        environ.getPosix("TMPDIR") orelse "/tmp";
+    var len = dir.len;
+    while (len > 0 and std.fs.path.isSep(dir[len - 1])) len -= 1;
+    return dir[0..len];
 }
 
-// A scratch allocator backed by an arena. Supports save/restore of position
-// so it doesn't permanently grow.
+/// Returns the value of the environment variable `name` as WTF-8, or null if it's
+/// not set. On windows the value is converted into memory owned by `allocator`,
+/// elsewhere it points into the environment block and nothing is allocated.
+fn getEnv(allocator: std.mem.Allocator, environ: std.process.Environ, comptime name: []const u8) ?[]const u8 {
+    if (builtin.os.tag != .windows) return environ.getPosix(name);
+    const value = environ.getWindows(std.unicode.wtf8ToWtf16LeStringLiteral(name)) orelse return null;
+    return std.unicode.wtf16LeToWtf8Alloc(allocator, value) catch |e| oom(e);
+}
+
+const path_env_sep: u8 = if (builtin.os.tag == .windows) ';' else ':';
+
+fn allocPathEnv(allocator: std.mem.Allocator, environ: std.process.Environ) ?[]const u8 {
+    return getEnv(allocator, environ, "PATH");
+}
+
+/// A stack allocator for temporary memory. Allocations are bumped out of a list
+/// of chunks. position() saves a restore point and restorePosition() releases
+/// everything allocated after it while retaining capacity. free only reclaims
+/// the most recent allocation.
+///
+/// When the top chunk is full it's first grown in place, otherwise the stack
+/// moves to the next chunk kept from before a rewind if it fits, otherwise a new
+/// chunk at least twice the size of the top one is inserted after it. Chunks are
+/// never returned to the backing allocator; the process exit frees them.
+///
+/// Positions are offsets into one continuous space: each chunk starts where the
+/// previous chunk's capacity ends, so positions only increase as the stack grows.
 const Scratch = struct {
-    arena: std.heap.ArenaAllocator,
+    backing: std.mem.Allocator,
+    /// The chunk the next allocation comes from, null until the first allocation.
+    top: ?*Chunk = null,
+    /// Offset of the end of the most recent allocation in top's data.
+    end: usize = 0,
 
-    pub fn init(a: std.mem.Allocator) Scratch {
-        return .{ .arena = .init(a) };
+    const min_chunk_len = 64 * 1024;
+
+    const Chunk = struct {
+        prev: ?*Chunk,
+        /// A chunk kept from before a rewind, reused if big enough.
+        next: ?*Chunk,
+        /// Position of the start of this chunk's data. Only valid for top and
+        /// the chunks before it; set when the stack moves into a chunk.
+        base: usize,
+        /// Capacity of this chunk's data, which follows the header in memory.
+        len: usize,
+
+        fn data(chunk: *Chunk) [*]u8 {
+            return @as([*]u8, @ptrCast(chunk)) + @sizeOf(Chunk);
+        }
+
+        /// The memory allocated from the backing allocator for this chunk.
+        fn allocation(chunk: *Chunk) []align(@alignOf(Chunk)) u8 {
+            return @as([*]align(@alignOf(Chunk)) u8, @ptrCast(chunk))[0 .. @sizeOf(Chunk) + chunk.len];
+        }
+    };
+
+    pub fn init(backing: std.mem.Allocator) Scratch {
+        return .{ .backing = backing };
     }
 
     pub fn allocator(scratch: *Scratch) std.mem.Allocator {
-        return scratch.arena.allocator();
+        return .{ .ptr = scratch, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = freeFn,
+        } };
     }
 
-    pub fn position(scratch: *Scratch) usize {
-        return scratch.arena.state.end_index;
+    pub fn position(scratch: *const Scratch) usize {
+        const top = scratch.top orelse return 0;
+        return top.base + scratch.end;
     }
 
     pub fn restorePosition(scratch: *Scratch, p: usize) void {
-        scratch.arena.state.end_index = p;
+        std.debug.assert(p <= scratch.position());
+        var top = scratch.top orelse return;
+        while (p < top.base) top = top.prev.?;
+        scratch.top = top;
+        scratch.end = p - top.base;
     }
 
     pub fn freeLifo(scratch: *Scratch, memory: anytype) void {
         const p = scratch.position();
-        scratch.arena.allocator().free(memory);
+        scratch.allocator().free(memory);
         std.debug.assert(p != scratch.position());
     }
     pub fn free(scratch: *Scratch, memory: anytype) void {
-        scratch.arena.allocator().free(memory);
+        scratch.allocator().free(memory);
+    }
+
+    /// Returns the offset of `memory` in top's data if it's the most recent allocation.
+    fn lastAllocationOffset(scratch: *const Scratch, memory: []u8) ?usize {
+        const top = scratch.top orelse return null;
+        const data_addr = @intFromPtr(top.data());
+        const addr = @intFromPtr(memory.ptr);
+        if (addr < data_addr or addr + memory.len != data_addr + scratch.end) return null;
+        return addr - data_addr;
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        _ = ret_addr;
+        const scratch: *Scratch = @ptrCast(@alignCast(ctx));
+        if (scratch.top) |top| {
+            if (bump(top, scratch.end, len, alignment)) |start| {
+                scratch.end = start + len;
+                return top.data() + start;
+            }
+            // Grow the top chunk in place.
+            const grown_len = @max(scratch.end + len + alignment.toByteUnits(), top.len * 2);
+            if (scratch.backing.resize(top.allocation(), @sizeOf(Chunk) + grown_len)) {
+                top.len = grown_len;
+                const start = bump(top, scratch.end, len, alignment).?;
+                scratch.end = start + len;
+                return top.data() + start;
+            }
+            // Reuse the next chunk kept from before a rewind.
+            if (top.next) |next| {
+                if (bump(next, 0, len, alignment)) |start| {
+                    next.base = top.base + top.len;
+                    scratch.top = next;
+                    scratch.end = start + len;
+                    return next.data() + start;
+                }
+            }
+        }
+        const chunk = scratch.insertChunk(len + alignment.toByteUnits()) orelse return null;
+        const start = bump(chunk, 0, len, alignment).?;
+        scratch.top = chunk;
+        scratch.end = start + len;
+        return chunk.data() + start;
+    }
+
+    /// Returns where an allocation would start in `chunk` if it fits after `end`.
+    fn bump(chunk: *Chunk, end: usize, len: usize, alignment: std.mem.Alignment) ?usize {
+        const data_addr = @intFromPtr(chunk.data());
+        const start = alignment.forward(data_addr + end) - data_addr;
+        if (start + len > chunk.len) return null;
+        return start;
+    }
+
+    /// Allocates a chunk with room for at least `min_len` bytes and at least
+    /// twice the size of top, and inserts it after top ahead of any kept chunks.
+    fn insertChunk(scratch: *Scratch, min_len: usize) ?*Chunk {
+        const prev = scratch.top;
+        const prev_len = if (prev) |p| p.len else 0;
+        const len = @max(min_len, min_chunk_len, prev_len * 2);
+        const memory = scratch.backing.alignedAlloc(u8, .of(Chunk), @sizeOf(Chunk) + len) catch return null;
+        const chunk: *Chunk = @ptrCast(memory.ptr);
+        chunk.* = .{
+            .prev = prev,
+            .next = if (prev) |p| p.next else null,
+            .base = if (prev) |p| p.base + p.len else 0,
+            .len = len,
+        };
+        if (chunk.next) |next| next.prev = chunk;
+        if (prev) |p| p.next = chunk;
+        return chunk;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        _ = alignment;
+        _ = ret_addr;
+        const scratch: *Scratch = @ptrCast(@alignCast(ctx));
+        const offset = scratch.lastAllocationOffset(memory) orelse return new_len <= memory.len;
+        if (offset + new_len > scratch.top.?.len) return false;
+        scratch.end = offset + new_len;
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        return if (resize(ctx, memory, alignment, new_len, ret_addr)) memory.ptr else null;
+    }
+
+    fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        _ = alignment;
+        _ = ret_addr;
+        const scratch: *Scratch = @ptrCast(@alignCast(ctx));
+        if (scratch.lastAllocationOffset(memory)) |offset| scratch.end = offset;
     }
 };
 
-fn allocAppDataPath(allocator: std.mem.Allocator) [:0]const u8 {
+/// Sums the capacity of every chunk, including those kept past top.
+fn testScratchCapacity(scratch: *const Scratch) usize {
+    var first = scratch.top orelse return 0;
+    while (first.prev) |p| first = p;
+    var total: usize = 0;
+    var it: ?*Scratch.Chunk = first;
+    while (it) |c| : (it = c.next) total += c.len;
+    return total;
+}
+
+test "Scratch rewinds across chunks and retains capacity" {
+    var scratch: Scratch = .init(std.testing.allocator);
+    defer {
+        // Scratch never frees chunks, so free them here for the leak checker.
+        if (scratch.top) |top| {
+            var first = top;
+            while (first.prev) |p| first = p;
+            var it: ?*Scratch.Chunk = first;
+            while (it) |c| {
+                it = c.next;
+                std.testing.allocator.free(c.allocation());
+            }
+        }
+    }
+    const a = scratch.allocator();
+
+    try std.testing.expectEqual(0, scratch.position());
+    const small = try a.alloc(u8, 10);
+    try std.testing.expectEqual(10, scratch.position());
+
+    // A LIFO free reclaims; a resize of the last allocation grows in place.
+    scratch.freeLifo(small);
+    try std.testing.expectEqual(0, scratch.position());
+    var grow = try a.alloc(u8, 10);
+    try std.testing.expect(a.resize(grow, 100));
+    grow = grow.ptr[0..100];
+    try std.testing.expectEqual(100, scratch.position());
+
+    // Overflow the first chunk (grown in place or spilled into a new one), then
+    // rewind to before it: positions rewind and capacity is retained.
+    const saved = scratch.position();
+    const big = try a.alloc(u8, Scratch.min_chunk_len * 3);
+    @memset(big, 0xaa);
+    try std.testing.expect(scratch.position() >= saved + big.len);
+    const capacity = testScratchCapacity(&scratch);
+    scratch.restorePosition(saved);
+    try std.testing.expectEqual(saved, scratch.position());
+    try std.testing.expectEqual(capacity, testScratchCapacity(&scratch));
+
+    // Allocating the same amount again needs no new capacity.
+    @memset(try a.alloc(u8, Scratch.min_chunk_len * 3), 0xbb);
+    try std.testing.expectEqual(capacity, testScratchCapacity(&scratch));
+
+    // Rewinding to the start keeps everything too.
+    scratch.restorePosition(0);
+    try std.testing.expectEqual(0, scratch.position());
+    try std.testing.expectEqual(capacity, testScratchCapacity(&scratch));
+
+    // Aligned allocations are aligned.
+    const aligned = try a.alignedAlloc(u8, .@"64", 1);
+    try std.testing.expect(std.mem.isAligned(@intFromPtr(aligned.ptr), 64));
+}
+
+fn allocAppDataPath(allocator: std.mem.Allocator, environ: std.process.Environ) [:0]const u8 {
     switch (builtin.os.tag) {
         .macos => {
-            const home_dir = std.posix.getenv("HOME") orelse errExit("no HOME", .{});
+            const home_dir = environ.getPosix("HOME") orelse errExit("no HOME", .{});
             return std.fs.path.joinZ(
                 allocator,
                 &[_][]const u8{ home_dir, "Library", "Application Support", "hew" },
             ) catch |e| oom(e);
         },
-        .linux, .freebsd, .netbsd, .dragonfly, .openbsd, .solaris, .illumos, .serenity => {
-            if (std.posix.getenv("XDG_DATA_HOME")) |xdg| {
+        .linux, .freebsd, .netbsd, .dragonfly, .openbsd, .illumos, .serenity => {
+            if (environ.getPosix("XDG_DATA_HOME")) |xdg| {
                 if (xdg.len > 0) return std.fs.path.joinZ(allocator, &.{ xdg, "hew" }) catch |e| oom(e);
             }
-            if (std.posix.getenv("HOME")) |home| return std.fs.path.joinZ(
+            if (environ.getPosix("HOME")) |home| return std.fs.path.joinZ(
                 allocator,
                 &.{ home, ".local", "share", "hew" },
             ) catch |e| oom(e);
             errExit("no HOME nor XDG_DATA_HOME", .{});
         },
         .windows => {
-            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const app_data_len = getEnvWindows(L("LOCALAPPDATA"), &path_buf) orelse errExit("missing LOCALAPPDATA environment variable", .{});
-            const trimmed = blk: {
-                var trimmed = app_data_len;
-                while (trimmed > 0 and std.fs.path.isSep(path_buf[trimmed - 1])) {
-                    trimmed -= 1;
-                }
-                break :blk trimmed;
-            };
+            const app_data = getEnv(allocator, environ, "LOCALAPPDATA") orelse errExit("missing LOCALAPPDATA environment variable", .{});
+            var trimmed = app_data.len;
+            while (trimmed > 0 and std.fs.path.isSep(app_data[trimmed - 1])) {
+                trimmed -= 1;
+            }
             return std.mem.concatWithSentinel(
                 allocator,
                 u8,
-                &.{ path_buf[0..trimmed], "\\hew" },
+                &.{ app_data[0..trimmed], "\\hew" },
                 0,
             ) catch |e| oom(e);
         },
@@ -2351,14 +2596,14 @@ fn allocAppDataPath(allocator: std.mem.Allocator) [:0]const u8 {
     }
 }
 
-fn allocCachePath(allocator: std.mem.Allocator, app_data_path: [:0]const u8) [:0]const u8 {
+fn allocCachePath(allocator: std.mem.Allocator, environ: std.process.Environ, app_data_path: [:0]const u8) [:0]const u8 {
     if (builtin.os.tag == .windows) {
         return std.fs.path.joinZ(allocator, &.{ app_data_path, "cache", "p" }) catch |e| oom(e);
     }
-    if (std.posix.getenv("XDG_CACHE_HOME")) |xdg| {
+    if (environ.getPosix("XDG_CACHE_HOME")) |xdg| {
         return std.fmt.allocPrintSentinel(allocator, "{s}/hew/p", .{xdg}, 0) catch |e| oom(e);
     }
-    if (std.posix.getenv("HOME")) |home| {
+    if (environ.getPosix("HOME")) |home| {
         return std.fmt.allocPrintSentinel(allocator, "{s}/.cache/hew/p", .{home}, 0) catch |e| oom(e);
     }
     errExit("neither XDG_CACHE_HOME nor HOME is set", .{});
@@ -2366,6 +2611,7 @@ fn allocCachePath(allocator: std.mem.Allocator, app_data_path: [:0]const u8) [:0
 
 fn allocBinPath(
     allocator: std.mem.Allocator,
+    ctx: *const ProcessEnv,
     scratch: *Scratch,
     interactive: bool,
     app_data_path: []const u8,
@@ -2381,21 +2627,13 @@ fn allocBinPath(
     ) catch @panic("app data path too long");
 
     var bin_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (try readBinPath(bin_setting_path, &bin_path_buf)) |stored|
-        return allocator.dupeZ(u8, stored) catch |e| oom(e);
+    if (try readBinPath(ctx.io, bin_setting_path, &bin_path_buf)) |stored|
+        return allocator.dupeSentinel(u8, stored, 0) catch |e| oom(e);
 
     if (!interactive) errExit("install bin path is not configured and --non-interactive has been set", .{});
 
-    const path_env = if (builtin.os.tag == .windows)
-        std.process.getEnvVarOwned(allocator, "PATH") catch |err| switch (err) {
-            error.EnvironmentVariableNotFound => errExit("no valid install directory (PATH is empty)", .{}),
-            error.OutOfMemory => |e| oom(e),
-            error.InvalidWtf8 => errExit("PATH is invalid wtf8", .{}),
-        }
-    else
-        std.posix.getenv("PATH") orelse "";
+    const path_env = allocPathEnv(allocator, ctx.environ) orelse errExit("no valid install directory (PATH is empty)", .{});
 
-    const path_env_sep: u8 = if (builtin.os.tag == .windows) ';' else ':';
     const path_env_count = blk: {
         var count: usize = 0;
         var it = std.mem.tokenizeScalar(u8, path_env, path_env_sep);
@@ -2407,7 +2645,7 @@ fn allocBinPath(
 
     if (path_env_count == 0) errExit("no valid install directory (PATH is empty)", .{});
 
-    var entries: std.ArrayList([]const u8) = .{};
+    var entries: std.ArrayList([]const u8) = .empty;
     defer {
         var it = std.mem.reverseIterator(entries.items);
         while (it.next()) |entry| {
@@ -2418,15 +2656,15 @@ fn allocBinPath(
     try entries.ensureTotalCapacity(scratch.allocator(), path_env_count);
 
     var stderr_buf: [4096]u8 = undefined;
-    var stderr = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr = std.Io.File.stderr().writer(ctx.io, &stderr_buf);
     const w = &stderr.interface;
 
     w.print("checking PATH for potential install directories...\n", .{}) catch return stderr.err.?;
 
     {
-        var it = std.mem.tokenizeScalar(u8, path_env, if (builtin.os.tag == .windows) ';' else ':');
+        var it = std.mem.tokenizeScalar(u8, path_env, path_env_sep);
         while (it.next()) |entry| {
-            const expanded = try pathenv.expand(scratch.allocator(), entry);
+            const expanded = try pathenv.expand(scratch.allocator(), ctx.environ, entry);
             var expanded_owned = true;
             defer if (expanded_owned) scratch.allocator().free(expanded);
 
@@ -2438,7 +2676,7 @@ fn allocBinPath(
             };
             if (is_duplicate) continue;
 
-            switch (try checkBinPath(expanded)) {
+            switch (try checkBinPath(ctx.io, expanded)) {
                 .ok => {
                     entries.appendAssumeCapacity(expanded);
                     expanded_owned = false;
@@ -2457,6 +2695,7 @@ fn allocBinPath(
         w.print("{d}: {s}\n", .{ i + 1, entry }) catch return stderr.err.?;
     }
     const selection = promptNumber(
+        ctx.io,
         &stderr.interface,
         "Where should hew install cli tools?",
         entries.items.len,
@@ -2467,29 +2706,30 @@ fn allocBinPath(
     if (selection == 0) errExit("user cancelled", .{});
     const selected_path = entries.items[selection - 1];
 
-    try writeBinPath(bin_setting_path, selected_path);
+    try writeBinPath(ctx.io, bin_setting_path, selected_path);
 
     {
         // Read it back to verify.
         var verify_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const readback = (try readBinPath(bin_setting_path, &verify_buf)) orelse
+        const readback = (try readBinPath(ctx.io, bin_setting_path, &verify_buf)) orelse
             return reportError("verification failed: bin setting file '{s}' not found after writing", .{bin_setting_path});
         if (!std.mem.eql(u8, readback, selected_path))
             return reportError("verification failed: wrote '{s}' but read back '{s}'", .{ selected_path, readback });
     }
 
-    return allocator.dupeZ(u8, selected_path) catch |e| oom(e);
+    return allocator.dupeSentinel(u8, selected_path, 0) catch |e| oom(e);
 }
 
-fn readBinPath(bin_setting_path: []const u8, buf: *[std.fs.max_path_bytes]u8) error{Reported}!?[:0]const u8 {
-    const file = std.fs.openFileAbsolute(bin_setting_path, .{}) catch |err| switch (err) {
+fn readBinPath(io: std.Io, bin_setting_path: []const u8, buf: *[std.fs.max_path_bytes]u8) error{Reported}!?[:0]const u8 {
+    const file = std.Io.Dir.openFileAbsolute(io, bin_setting_path, .{}) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => |e| return reportError("open '{s}' failed with {t}", .{ bin_setting_path, e }),
     };
-    defer file.close();
-    const len = file.readAll(buf) catch |e| return reportError(
+    defer file.close(io);
+    var reader = file.reader(io, &.{});
+    const len = reader.interface.readSliceShort(buf) catch return reportError(
         "read '{s}' failed with {t}",
-        .{ bin_setting_path, e },
+        .{ bin_setting_path, reader.err.? },
     );
     if (len == 0) return reportError("bin setting file '{s}' is empty", .{bin_setting_path});
     if (len >= buf.len) return reportError("bin path in '{s}' is too long", .{bin_setting_path});
@@ -2500,18 +2740,18 @@ fn readBinPath(bin_setting_path: []const u8, buf: *[std.fs.max_path_bytes]u8) er
     return stored;
 }
 
-fn writeBinPath(bin_setting_path: []const u8, bin_path: []const u8) error{Reported}!void {
-    if (std.fs.path.dirname(bin_setting_path)) |d| std.fs.cwd().makePath(d) catch |e| return reportError(
+fn writeBinPath(io: std.Io, bin_setting_path: []const u8, bin_path: []const u8) error{Reported}!void {
+    if (std.fs.path.dirname(bin_setting_path)) |d| std.Io.Dir.cwd().createDirPath(io, d) catch |e| return reportError(
         "make path '{s}' failed with {t}",
         .{ d, e },
     );
     // TODO: should we write it to a temp file first and then rename?
-    const file = std.fs.createFileAbsolute(bin_setting_path, .{}) catch |e| return reportError(
+    const file = std.Io.Dir.createFileAbsolute(io, bin_setting_path, .{}) catch |e| return reportError(
         "create '{s}' failed with {t}",
         .{ bin_setting_path, e },
     );
-    defer file.close();
-    file.writeAll(bin_path) catch |e| return reportError(
+    defer file.close(io);
+    file.writeStreamingAll(io, bin_path) catch |e| return reportError(
         "write {} bytes '{s}' to '{s}' failed with {t}",
         .{ bin_path.len, bin_path, bin_setting_path, e },
     );
@@ -2529,10 +2769,9 @@ const FmtExpanded = struct {
     }
 };
 
-fn promptYesNo(w: *std.Io.Writer, comptime fmt: []const u8, args: anytype) !bool {
-    const stdin = std.fs.File.stdin();
+fn promptYesNo(io: std.Io, w: *std.Io.Writer, comptime fmt: []const u8, args: anytype) !bool {
     var read_buf: [100]u8 = undefined;
-    var reader = stdin.reader(&read_buf);
+    var reader = std.Io.File.stdin().readerStreaming(io, &read_buf);
     try w.print(fmt ++ " [y/n]: ", args);
     try w.flush();
     while (true) {
@@ -2540,7 +2779,7 @@ fn promptYesNo(w: *std.Io.Writer, comptime fmt: []const u8, args: anytype) !bool
             error.ReadFailed => return reader.err.?,
             error.StreamTooLong => errExit("input too long", .{}),
         } orelse errExit("unexpected end of stdin", .{});
-        const trimmed = std.mem.trimRight(u8, line, "\r");
+        const trimmed = std.mem.trimEnd(u8, line, "\r");
         if (std.mem.eql(u8, trimmed, "y") or std.mem.eql(u8, trimmed, "Y")) return true;
         if (std.mem.eql(u8, trimmed, "n") or std.mem.eql(u8, trimmed, "N")) return false;
         try w.print("please enter 'y' or 'n': ", .{});
@@ -2548,11 +2787,9 @@ fn promptYesNo(w: *std.Io.Writer, comptime fmt: []const u8, args: anytype) !bool
     }
 }
 
-fn promptNumber(w: *std.Io.Writer, str: []const u8, max: usize) !usize {
-    const stdin = std.fs.File.stdin();
-
+fn promptNumber(io: std.Io, w: *std.Io.Writer, str: []const u8, max: usize) !usize {
     var read_buf: [100]u8 = undefined;
-    var reader = stdin.reader(&read_buf);
+    var reader = std.Io.File.stdin().readerStreaming(io, &read_buf);
     while (true) {
         try w.print("{s} [0-{d}]: ", .{ str, max });
         try w.flush();
@@ -2561,7 +2798,7 @@ fn promptNumber(w: *std.Io.Writer, str: []const u8, max: usize) !usize {
             error.ReadFailed => return reader.err.?,
             error.StreamTooLong => errExit("input too long", .{}),
         } orelse errExit("unexpected end of stdin", .{});
-        const trimmed = std.mem.trimRight(u8, line, "\r");
+        const trimmed = std.mem.trimEnd(u8, line, "\r");
         if (std.fmt.parseInt(usize, trimmed, 10)) |i| {
             if (i <= max) return i;
         } else |_| {}
@@ -2585,9 +2822,9 @@ const BinPath = union(enum) {
     ok,
     bad: BadBinPath,
 };
-fn checkBinPath(path: []const u8) error{Reported}!BinPath {
+fn checkBinPath(io: std.Io, path: []const u8) error{Reported}!BinPath {
     if (!std.fs.path.isAbsolute(path)) return .{ .bad = .@"not an absolute path" };
-    var dir = std.fs.openDirAbsolute(path, .{}) catch |err| return switch (err) {
+    var dir = std.Io.Dir.openDirAbsolute(io, path, .{}) catch |err| return switch (err) {
         error.AccessDenied => .{ .bad = .@"open dir access denied" },
         error.PermissionDenied => .{ .bad = .@"open dir permission denied" },
         error.NotDir => .{ .bad = .@"not a directory" },
@@ -2596,17 +2833,11 @@ fn checkBinPath(path: []const u8) error{Reported}!BinPath {
         error.FileNotFound => .{ .bad = .@"not found" },
         else => |e| return reportError("open dir '{s}' failed with {t}", .{ path, e }),
     };
-    defer dir.close();
+    defer dir.close(io);
 
-    const pid = switch (builtin.os.tag) {
-        .windows => std.os.windows.GetCurrentProcessId(),
-        .linux => std.os.linux.getpid(),
-        .macos => std.c.getpid(),
-        else => |os| @compileError("unsupported os: " ++ @tagName(os)),
-    };
     var test_name_buf: [64]u8 = undefined;
-    const test_name = std.fmt.bufPrint(&test_name_buf, "hew-bin-test-{d}", .{pid}) catch unreachable;
-    const test_file = dir.createFile(test_name, .{ .mode = 0o755 }) catch |err| return switch (err) {
+    const test_name = std.fmt.bufPrint(&test_name_buf, "hew-bin-test-{d}", .{LockFile.getPid()}) catch unreachable;
+    const test_file = dir.createFile(io, test_name, .{ .permissions = .executable_file }) catch |err| return switch (err) {
         error.AccessDenied => .{ .bad = .@"write file access denied" },
         error.PermissionDenied => .{ .bad = .@"write file permission denied" },
         // workaround issue on macos, fix at codeberg pull #31615
@@ -2616,14 +2847,24 @@ fn checkBinPath(path: []const u8) error{Reported}!BinPath {
         } else return reportError("create bin test file in '{s}' failed with unexpected error", .{path}),
         else => |e| return reportError("create bin test file in '{s}' failed with {t}", .{ path, e }),
     };
-    test_file.close();
-    dir.deleteFile(test_name) catch |e| return reportError("delete bin test file '{s}' failed with {t}", .{ path, e });
+    test_file.close(io);
+    dir.deleteFile(io, test_name) catch |e| return reportError("delete bin test file '{s}' failed with {t}", .{ path, e });
     return .ok;
 }
 
-fn timerStart() std.time.Timer {
-    return std.time.Timer.start() catch @panic("no timer support");
-}
+const Timer = struct {
+    io: std.Io,
+    start: std.Io.Timestamp,
+
+    fn init(io: std.Io) Timer {
+        return .{ .io = io, .start = .now(io, .awake) };
+    }
+
+    fn seconds(t: Timer) f64 {
+        const ns = t.start.untilNow(t.io, .awake).toNanoseconds();
+        return @as(f64, @floatFromInt(ns)) / std.time.ns_per_s;
+    }
+};
 
 fn reportError(comptime fmt: []const u8, args: anytype) error{Reported} {
     log.err(fmt, args);
@@ -2643,14 +2884,23 @@ comptime {
 
 const log = std.log.scoped(.hew);
 
+pub const std_options: std.Options = .{
+    // Dispatch std.Io statically to std.Io.Threaded (see zig-staticio in build.zig).
+    .io_vtable = .threaded,
+    // wintrace reports crashes on windows instead of std, keeping std's stack
+    // tracing (and its PDB reader) out of release builds.
+    .enable_segfault_handler = if (builtin.os.tag == .windows) false else std.debug.default_enable_segfault_handler,
+    .allow_stack_tracing = if (builtin.os.tag == .windows) builtin.mode == .debug else !builtin.strip_debug_info,
+};
+
 const builtin = @import("builtin");
 const std = @import("std");
 const json = @import("json.zig");
 const pathenv = @import("pathenv.zig");
 const which = @import("which.zig");
+const wintrace = @import("wintrace");
 const GitSha = @import("GitSha.zig");
 const LockFile = @import("LockFile.zig");
-const L = std.unicode.utf8ToUtf16LeStringLiteral;
 const GitHost = @import("pkg.zig").GitHost;
 const Pkg = @import("pkg.zig").Pkg;
 const PkgGit = @import("pkg.zig").PkgGit;

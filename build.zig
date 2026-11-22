@@ -6,7 +6,7 @@ pub fn build(b: *std.Build) !void {
     //     "Associate lazy dependencies with steps and only fetch them if those steps are built"
     const ci_option = b.option(bool, "ci", "Enable the CI build step") orelse false;
 
-    const release_version = try makeCalVersion();
+    const release_version = try makeCalVersion(b.graph.io);
     const dev_version = b.fmt("{s}-dev", .{release_version});
     const write_files_version = b.addWriteFiles();
     const release_version_file = write_files_version.add("version-release", &release_version);
@@ -17,22 +17,19 @@ pub fn build(b: *std.Build) !void {
         .root_source_file = write_files_version.add("version-dev", dev_version),
     });
 
-    const hew_exe = b.addExecutable(.{
-        .name = "hew",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/hew.zig"),
-            .target = target,
-            .optimize = optimize,
-            .single_threaded = true,
-            .imports = &.{
-                .{
-                    .name = "version",
-                    .module = if (b.graph.env_map.get("HEW_BUILD_REVISION")) |r| b.createModule(.{
-                        .root_source_file = write_files_version.add("version-release-native", b.fmt("{s}-native", .{r})),
-                    }) else dev_version_embed,
-                },
-            },
-        }),
+    const patched_std = b.dependency("patch", .{
+        .std_patches = &[_]std.Build.LazyPath{
+            b.dependency("staticio", .{}).namedLazyPath("std.patch"),
+            b.path("src/std-path-space.patch"),
+        },
+    }).module("std");
+
+    const hew_exe = addHewExe(b, patched_std, .{
+        .target = target,
+        .optimize = optimize,
+        .version = if (b.graph.environ_map.get("HEW_BUILD_REVISION")) |r| b.createModule(.{
+            .root_source_file = write_files_version.add("version-release-native", b.fmt("{s}-native", .{r})),
+        }) else dev_version_embed,
     });
     const install_hew_exe = b.addInstallArtifact(hew_exe, .{});
     b.getInstallStep().dependOn(&install_hew_exe.step);
@@ -40,7 +37,7 @@ pub fn build(b: *std.Build) !void {
     {
         const run = b.addRunArtifact(hew_exe);
         run.step.dependOn(&install_hew_exe.step);
-        if (b.args) |a| run.addArgs(a);
+        run.addPassthruArgs();
         b.step("run", "").dependOn(&run.step);
     }
 
@@ -54,22 +51,28 @@ pub fn build(b: *std.Build) !void {
         test_step.dependOn(&run.step);
     }
 
+    test_step.dependOn(addWinCodeNamesCheck(b, patched_std, dev_version_embed));
+
     {
-        const test_app_data = b.pathFromRoot("test/appdata");
-        const test_bin_path = b.pathFromRoot("test/bin");
-        // hacky to make a dir a configure time...but it works I guess
-        try std.fs.cwd().makePath(test_bin_path);
+        const test_app_data = rootPath(b, "test", "appdata");
+        const test_bin_path = rootPath(b, "test", "bin");
+        // The configure phase is cached so it can't create the bin dir; writing
+        // a file into it during the make phase creates it.
+        const make_test_bin = b.addUpdateSourceFiles();
+        make_test_bin.addBytesToSource("", "test/bin/.keep");
         const configure_bin = b.addRunArtifact(hew_exe);
+        configure_bin.step.dependOn(&make_test_bin.step);
         configure_bin.addArgs(&.{
             "new-bin-path",
             "--app-data",
             test_app_data,
             test_bin_path,
         });
-        configure_bin.addPathDir(test_bin_path);
+        addPathDir(b, configure_bin, test_bin_path);
 
-        const pkgs_txt_path = b.pathFromRoot("test/pkgs.txt");
-        const pkgs_txt = try std.fs.cwd().readFileAlloc(b.allocator, pkgs_txt_path, 1024 * 100);
+        const pkgs_txt_path = rootPath(b, "test", "pkgs.txt");
+        b.dependOnFileContents(b.path("test/pkgs.txt"));
+        const pkgs_txt = try std.Io.Dir.cwd().readFileAlloc(b.graph.io, pkgs_txt_path, b.allocator, .limited(1024 * 100));
         var line_it = std.mem.tokenizeScalar(u8, pkgs_txt, '\n');
         var lineno: u32 = 0;
         while (line_it.next()) |line| {
@@ -100,7 +103,7 @@ pub fn build(b: *std.Build) !void {
     ci_step.dependOn(b.getInstallStep());
     ci_step.dependOn(test_step);
     ci_step.dependOn(&b.addInstallFile(release_version_file, "version-release").step);
-    try ci(b, ci_option, release_version_embed, ci_step);
+    try ci(b, ci_option, patched_std, release_version_embed, ci_step);
 }
 
 fn addTestPkg(
@@ -117,7 +120,7 @@ fn addTestPkg(
     run.step.dependOn(install_hew_exe);
     run.step.dependOn(configure_bin);
     run.step.name = test_name;
-    run.addPathDir(test_bin_path);
+    addPathDir(b, run, test_bin_path);
     run.addArgs(&.{
         "install",
         "--non-interactive",
@@ -178,6 +181,7 @@ fn parsePkgsLine(pkgs_txt_path: []const u8, lineno: u32, line: []const u8) PkgsL
 fn ci(
     b: *std.Build,
     ci_option: bool,
+    patched_std: *std.Build.Module,
     release_version_embed: *std.Build.Module,
     ci_step: *std.Build.Step,
 ) !void {
@@ -218,17 +222,13 @@ fn ci(
         const target_dest_dir: std.Build.InstallDir = .{ .custom = ci_target_str };
         const install_exes = b.step(b.fmt("install-{s}", .{ci_target_str}), "");
         ci_step.dependOn(install_exes);
-        const hew_exe = b.addExecutable(.{
-            .name = "hew",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/hew.zig"),
-                .target = target,
-                .optimize = optimize,
-                .single_threaded = true,
-                .imports = &.{
-                    .{ .name = "version", .module = release_version_embed },
-                },
-            }),
+        const hew_exe = addHewExe(b, patched_std, .{
+            .target = target,
+            .optimize = optimize,
+            // Unstripped, a windows exe has the PDB identity wintrace's traces
+            // are matched to its PDB with (ReleaseSmall strips by default).
+            .strip = if (target.result.os.tag == .windows) false else null,
+            .version = release_version_embed,
         });
         install_exes.dependOn(
             &b.addInstallArtifact(hew_exe, .{
@@ -263,47 +263,35 @@ fn makeCiArchiveStep(
     target_install_dir: std.Build.InstallDir,
     install_exes: *std.Build.Step,
 ) *std.Build.Step {
-    const install_path = b.getInstallPath(.prefix, ".");
+    // The archive is created in the cache, then installed to the prefix.
+    const target_install_path: std.Build.LazyPath = .{ .relative = .{
+        .base = .install_prefix,
+        .sub_path = target_install_dir.custom,
+    } };
 
     if (target.os.tag == .windows) {
-        const out_zip_file = b.pathJoin(&.{
-            install_path,
-            b.fmt("hew-{s}.zip", .{ci_target_str}),
-        });
-        if (maybe_zip_exe) |zip_exe| {
-            const zip = b.addRunArtifact(zip_exe);
-            zip.addArg(out_zip_file);
-            zip.addArg("hew.exe");
-            zip.cwd = .{ .cwd_relative = b.getInstallPath(
-                target_install_dir,
-                ".",
-            ) };
-            zip.step.dependOn(install_exes);
-            return &zip.step;
-        }
-        return &b.addFail("the ci step (more specifically the 'archive' step) requires the -Dci build option").step;
+        const zip_exe = maybe_zip_exe orelse
+            return &b.addFail("the ci step (more specifically the 'archive' step) requires the -Dci build option").step;
+        const zip_name = b.fmt("hew-{s}.zip", .{ci_target_str});
+        const zip = b.addRunArtifact(zip_exe);
+        const out_zip_file = zip.addOutputFileArg(zip_name);
+        zip.addArg("hew.exe");
+        zip.cwd = target_install_path;
+        zip.step.dependOn(install_exes);
+        return &b.addInstallFile(out_zip_file, zip_name).step;
     }
 
-    const targz = b.pathJoin(&.{
-        install_path,
-        b.fmt("hew-{s}.tar.gz", .{ci_target_str}),
-    });
-    const tar = b.addSystemCommand(&.{
-        "tar",
-        "-czf",
-        targz,
-        "hew",
-    });
-    tar.cwd = .{ .cwd_relative = b.getInstallPath(
-        target_install_dir,
-        ".",
-    ) };
+    const targz_name = b.fmt("hew-{s}.tar.gz", .{ci_target_str});
+    const tar = b.addSystemCommand(&.{ "tar", "-czf" });
+    const targz = tar.addOutputFileArg(targz_name);
+    tar.addArg("hew");
+    tar.cwd = target_install_path;
     tar.step.dependOn(install_exes);
-    return &tar.step;
+    return &b.addInstallFile(targz, targz_name).step;
 }
 
-fn makeCalVersion() ![11]u8 {
-    const now = std.time.epoch.EpochSeconds{ .secs = @intCast(std.time.timestamp()) };
+fn makeCalVersion(io: std.Io) ![11]u8 {
+    const now = std.time.epoch.EpochSeconds{ .secs = @intCast(std.Io.Clock.real.now(io).toSeconds()) };
     const day = now.getEpochDay();
     const year_day = day.calculateYearDay();
     const month_day = year_day.calculateMonthDay();
@@ -320,3 +308,82 @@ fn makeCalVersion() ![11]u8 {
 const builtin = @import("builtin");
 const std = @import("std");
 const Pkg = @import("src/pkg.zig").Pkg;
+
+const HewExeOptions = struct {
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    strip: ?bool = null,
+    version: *std.Build.Module,
+};
+
+fn addHewExe(b: *std.Build, patched_std: *std.Build.Module, options: HewExeOptions) *std.Build.Step.Compile {
+    const module = b.createModule(.{
+        .root_source_file = b.path("src/hew.zig"),
+        .target = options.target,
+        .optimize = options.optimize,
+        .strip = options.strip,
+        .single_threaded = true,
+        .imports = &.{
+            .{ .name = "std", .module = patched_std },
+            .{ .name = "version", .module = options.version },
+        },
+    });
+    // On windows wintrace reports hew's crashes (see panic and main in src/hew.zig).
+    if (options.target.result.os.tag == .windows) {
+        if (b.lazyDependency("wintrace", .{})) |dep| module.addImport("wintrace", dep.module("wintrace"));
+    }
+    return b.addExecutable(.{ .name = "hew", .root_module = module });
+}
+
+/// Checks hew's windows release builds never print a windows code as a tag name,
+/// and that the check still detects one (see test/check_win_code_names.zig).
+/// Cross-compiles, so it runs on any host.
+fn addWinCodeNamesCheck(b: *std.Build, patched_std: *std.Build.Module, version: *std.Build.Module) *std.Build.Step {
+    const step = b.step("check-win-code-names", "Check hew's windows release builds don't contain windows code names");
+    const checker = b.addExecutable(.{
+        .name = "check_win_code_names",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/check_win_code_names.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    const windows = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .windows });
+
+    const control = b.addExecutable(.{
+        .name = "win_code_names_control",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/win_code_names_control.zig"),
+            .target = windows,
+            .optimize = .ReleaseSmall,
+        }),
+    });
+    const check_control = b.addRunArtifact(checker);
+    check_control.addArg("present");
+    check_control.addFileArg(control.getEmittedBin());
+    step.dependOn(&check_control.step);
+
+    for ([_]std.builtin.OptimizeMode{ .ReleaseSmall, .ReleaseFast }) |optimize| {
+        const exe = addHewExe(b, patched_std, .{ .target = windows, .optimize = optimize, .version = version });
+        const check = b.addRunArtifact(checker);
+        check.addArg("absent");
+        check.addFileArg(exe.getEmittedBin());
+        step.dependOn(&check.step);
+    }
+    return step;
+}
+
+/// Prepends `dir` to the PATH environment variable of `run`.
+fn addPathDir(b: *std.Build, run: *std.Build.Step.Run, dir: []const u8) void {
+    const sep = if (builtin.os.tag == .windows) ";" else ":";
+    run.setEnvironmentVariable("PATH", if (b.graph.environ_map.get("PATH")) |path|
+        b.fmt("{s}{s}{s}", .{ dir, sep, path })
+    else
+        dir);
+}
+
+/// Joins `dir` and `name` onto the build root with native path separators. hew
+/// compares installed paths byte-for-byte with PATH entries derived from these.
+fn rootPath(b: *std.Build, dir: []const u8, name: []const u8) []const u8 {
+    const root = b.root.root_dir.path orelse @panic("build root has no path");
+    return b.pathJoin(&.{ root, b.root.sub_path, dir, name });
+}

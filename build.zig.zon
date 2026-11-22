@@ -2,12 +2,27 @@
     .name = .hew,
     .fingerprint = 0x6f6e38f761c1afa2,
     .version = "0.0.1",
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.17.0",
+    .zig_version = "0.17.1",
     .dependencies = .{
         // used on the CI for create zip files on windows
         .zipcmdline = .{
-            .url = "git+https://github.com/marler8997/zipcmdline#a8807944231b46565450504cb7f3146e29e51335",
-            .hash = "zipcmdline-0.0.0-DFii09hmAwAK1TuCE9eIMZANDZRJnodAHOUOCM8pAPO3",
+            .url = "git+https://github.com/marler8997/zipcmdline#91c3e14fb36347d7ef952b8ab74e95caa246b772",
+            .hash = "zipcmdline-0.0.0-DFii0-7PAAAXtEEiGPMCElsh9ADun8-EedbgyGKyUfCe",
+            .lazy = true,
+        },
+        .patch = .{
+            .url = "git+https://github.com/marler8997/zig-patch#07e0704e8337e0525cbb9c02cc6ff94682129a64",
+            .hash = "patch-0.0.0-WCKjs9q1AADtBsFLsb_cWBxRMFbHol2iMsLyn0zizpJb",
+        },
+        .staticio = .{
+            .url = "git+https://github.com/marler8997/zig-staticio#1ef1b4374703b72beb44e494cc9d03d7944567e3",
+            .hash = "staticio-0.0.0-ypcguAK1AADvFgpnMy2lYwxPrSFYq-Z4rw11Spk142R7",
+        },
+        .wintrace = .{
+            .url = "git+https://github.com/marler8997/wintrace#cc3abae1a2bf983d18ef12e7dc3c25841f4af561",
+            .hash = "wintrace-0.0.0-RwkrxRZ2AgCW4RIfUAeI75IB8shdP6warZnLxfxvEC0X",
+            // only imported when targeting windows
             .lazy = true,
         },
     },
