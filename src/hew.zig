@@ -517,200 +517,50 @@ const GitArchive = union(enum) {
     };
 };
 
-fn getLatestReleaseGithub(scratch: *Scratch, http: Http, owner_repo: *const OwnerRepo) GitArchive {
-    log.info("fetching latest release for github:{s}...", .{owner_repo.string});
-    const release_url = std.fmt.allocPrint(
-        scratch.allocator(),
-        "https://api.github.com/repos/{s}/releases/latest",
-        .{owner_repo.string},
-    ) catch |e| oom(e);
-    defer scratch.allocator().free(release_url);
-    var timer: Timer = .init(http.ctx.io);
-    var fetch_result = fetchGitJson(release_url, http, scratch.allocator());
-    errdefer fetch_result.body.deinit(scratch.allocator());
-    if (fetch_result.status == .ok) {
-        const elapsed = timer.seconds();
-        log.info("fetched latest release JSON in {d:.2} seconds", .{elapsed});
-        const release = blk_release: {
-            var err: ParseJsonError = undefined;
-            break :blk_release parseReleaseGithub(
-                fetch_result.body.items,
-                &err,
-            ) catch jsonErrorExit(scratch, http.ctx, release_url, fetch_result.body.items, &err);
-        };
-        log.info("latest release is tag {s}", .{release.tag_name});
-        return .{ .rev = .{
-            .json = fetch_result.body,
-            .rev_name = release.tag_name,
-            .tarball_url = release.tarball_url,
-        } };
-    }
-    {
-        // Only fall back to tags if the releases endpoint returned "Not Found".
-        // Other 404s (e.g. repo doesn't exist) should still be fatal.
-        const is_no_releases = fetch_result.status == .not_found and blk_msg: {
-            var err: ParseJsonError = undefined;
-            const msg = parseMessage(fetch_result.body.items, &err) catch
-                jsonErrorExit(scratch, http.ctx, release_url, fetch_result.body.items, &err);
-            break :blk_msg std.mem.eql(u8, msg, "Not Found");
-        };
-        if (!is_no_releases)
-            fetchErrExit(release_url, fetch_result);
-    }
-    fetch_result.body.deinit(scratch.allocator());
-
-    // No releases found, fall back to latest tag.
-    log.info("no releases found, fetching latest tag for github:{s}...", .{owner_repo.string});
-    const tags_url = std.fmt.allocPrint(
-        scratch.allocator(),
-        "https://api.github.com/repos/{s}/tags?per_page=1",
-        .{owner_repo.string},
-    ) catch |e| oom(e);
-    defer scratch.allocator().free(tags_url);
-    timer = .init(http.ctx.io);
-    var tags_result = fetchGitJson(tags_url, http, scratch.allocator());
-    errdefer tags_result.body.deinit(scratch.allocator());
-    if (tags_result.status != .ok)
-        fetchErrExit(tags_url, tags_result);
-    const tags_elapsed = timer.seconds();
-    log.info("fetched latest tag JSON in {d:.2} seconds", .{tags_elapsed});
-    const tag_name = blk_tag: {
-        var err: ParseJsonError = undefined;
-        break :blk_tag (parseLatestTagGithub(tags_result.body.items, &err) catch |e| switch (e) {
-            error.ParseJson => jsonErrorExit(scratch, http.ctx, tags_url, tags_result.body.items, &err),
-        }) orelse {
-            log.info("no tags found either, falling back to tip for github:{s}...", .{owner_repo.string});
-            tags_result.body.deinit(scratch.allocator());
-            const tip_archive = fetchTipGithub(scratch, scratch.allocator(), owner_repo, http);
-            log.info("tip is commit {f}", .{&tip_archive.tip.sha});
-            return tip_archive;
-        };
-    };
-    log.info("latest tag is {s}", .{tag_name});
-    return .{ .rev = .{
-        .json = tags_result.body,
-        .rev_name = tag_name,
-        .tarball_url = allocUrlGithubTarball(scratch.allocator(), owner_repo, tag_name),
-    } };
+/// Writes the API URL of the package's repository, e.g. https://api.github.com/repos/OWNER/REPO.
+fn fmtRepoApi(pkg: *const PkgGit) FmtRepoApi {
+    return .{ .pkg = pkg };
 }
-fn getLatestReleaseCodeberg(scratch: *Scratch, http: Http, owner_repo: *const OwnerRepo) GitArchive {
-    log.info("fetching latest release for codeberg:{s}...", .{owner_repo.string});
-    const release_url = std.fmt.allocPrint(
-        scratch.allocator(),
-        "https://codeberg.org/api/v1/repos/{s}/releases/latest",
-        .{owner_repo.string},
-    ) catch |e| oom(e);
-    defer scratch.allocator().free(release_url);
-    var timer: Timer = .init(http.ctx.io);
-    var fetch_result = fetchGitJson(release_url, http, scratch.allocator());
-    errdefer fetch_result.body.deinit(scratch.allocator());
-    if (fetch_result.status == .ok) {
-        const elapsed = timer.seconds();
-        log.info("fetched latest release JSON in {d:.2} seconds", .{elapsed});
-        const release = blk_release: {
-            var err: ParseJsonError = undefined;
-            break :blk_release parseReleaseCodeberg(
-                fetch_result.body.items,
-                &err,
-            ) catch jsonErrorExit(scratch, http.ctx, release_url, fetch_result.body.items, &err);
-        };
-        log.info("latest release is tag {s}", .{release.tag_name});
-        return .{ .rev = .{
-            .json = fetch_result.body,
-            .rev_name = release.tag_name,
-            .tarball_url = release.tarball_url,
-        } };
-    }
-    {
-        // Only fall back to tags if the releases endpoint returned the generic
-        // forgejo "not found" message. Other 404s (e.g. owner doesn't exist)
-        // should still be fatal. Note that a missing repo under an existing
-        // owner also returns this message, but the tags request below will
-        // then fail with its own 404.
-        const is_no_releases = fetch_result.status == .not_found and blk_msg: {
-            var err: ParseJsonError = undefined;
-            const msg = parseMessage(fetch_result.body.items, &err) catch
-                jsonErrorExit(scratch, http.ctx, release_url, fetch_result.body.items, &err);
-            break :blk_msg std.mem.eql(u8, msg, "The target couldn't be found.");
-        };
-        if (!is_no_releases)
-            fetchErrExit(release_url, fetch_result);
-    }
-    fetch_result.body.deinit(scratch.allocator());
-
-    // No releases found, fall back to latest tag.
-    log.info("no releases found, fetching latest tag for codeberg:{s}...", .{owner_repo.string});
-    const tags_url = std.fmt.allocPrint(
-        scratch.allocator(),
-        "https://codeberg.org/api/v1/repos/{s}/tags?limit=1",
-        .{owner_repo.string},
-    ) catch |e| oom(e);
-    defer scratch.allocator().free(tags_url);
-    timer = .init(http.ctx.io);
-    var tags_result = fetchGitJson(tags_url, http, scratch.allocator());
-    errdefer tags_result.body.deinit(scratch.allocator());
-    if (tags_result.status != .ok)
-        fetchErrExit(tags_url, tags_result);
-    const tags_elapsed = timer.seconds();
-    log.info("fetched latest tag JSON in {d:.2} seconds", .{tags_elapsed});
-    const tag_name = blk_tag: {
-        var err: ParseJsonError = undefined;
-        break :blk_tag (parseLatestTagCodeberg(tags_result.body.items, &err) catch |e| switch (e) {
-            error.ParseJson => jsonErrorExit(scratch, http.ctx, tags_url, tags_result.body.items, &err),
-        }) orelse {
-            log.info("no tags found either, falling back to tip for codeberg:{s}...", .{owner_repo.string});
-            tags_result.body.deinit(scratch.allocator());
-            const tip_archive = fetchTipCodeberg(scratch, scratch.allocator(), owner_repo, http);
-            log.info("tip is commit {f}", .{&tip_archive.tip.sha});
-            return tip_archive;
-        };
-    };
-    log.info("latest tag is {s}", .{tag_name});
-    return .{ .rev = .{
-        .json = tags_result.body,
-        .rev_name = tag_name,
-        .tarball_url = allocUrlCodebergTarball(scratch.allocator(), owner_repo, tag_name),
-    } };
-}
-
-fn allocUrlGithubTarball(allocator: std.mem.Allocator, owner_repo: *const OwnerRepo, tag_name: []const u8) []u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "https://api.github.com/repos/{s}/tarball/{s}",
-        .{ owner_repo.string, tag_name },
-    ) catch |e| oom(e);
-}
-fn allocUrlGitlabTarball(allocator: std.mem.Allocator, owner_repo: *const OwnerRepo, sha: []const u8) []u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "https://gitlab.com/api/v4/projects/{f}/repository/archive.tar.gz?sha={s}",
-        .{ fmtGitlabProjectId(owner_repo), sha },
-    ) catch |e| oom(e);
-}
-fn allocUrlCodebergTarball(allocator: std.mem.Allocator, owner_repo: *const OwnerRepo, tag_name: []const u8) []u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "https://codeberg.org/api/v1/repos/{s}/archive/{s}.tar.gz",
-        .{ owner_repo.string, tag_name },
-    ) catch |e| oom(e);
-}
-
-fn fmtGitlabProjectId(owner_repo: *const OwnerRepo) FmtGitlabProjectId {
-    return .{ .owner_repo = owner_repo };
-}
-const FmtGitlabProjectId = struct {
-    owner_repo: *const OwnerRepo,
-    pub fn format(f: FmtGitlabProjectId, w: *std.Io.Writer) error{WriteFailed}!void {
-        try w.print("{s}%2F{s}", .{ f.owner_repo.owner(), f.owner_repo.repo() });
+const FmtRepoApi = struct {
+    pkg: *const PkgGit,
+    pub fn format(f: FmtRepoApi, w: *std.Io.Writer) error{WriteFailed}!void {
+        const pkg = f.pkg;
+        switch (pkg.forge) {
+            .github => if (std.ascii.eqlIgnoreCase(pkg.host, "github.com"))
+                try w.print("https://api.github.com/repos/{s}", .{pkg.path})
+            else
+                // GitHub Enterprise
+                try w.print("https://{s}/api/v3/repos/{s}", .{ pkg.host, pkg.path }),
+            .gitlab => {
+                // the project ID is its path with each '/' encoded
+                try w.print("https://{s}/api/v4/projects/", .{pkg.host});
+                for (pkg.path) |c| {
+                    if (c == '/') try w.writeAll("%2F") else try w.writeByte(c);
+                }
+            },
+            .forgejo => try w.print("https://{s}/api/v1/repos/{s}", .{ pkg.host, pkg.path }),
+        }
     }
 };
-fn getLatestReleaseGitlab(scratch: *Scratch, http: Http, owner_repo: *const OwnerRepo) GitArchive {
-    log.info("fetching latest release for gitlab:{s}...", .{owner_repo.string});
-    const release_url = std.fmt.allocPrint(
-        scratch.allocator(),
-        "https://gitlab.com/api/v4/projects/{f}/releases/permalink/latest",
-        .{fmtGitlabProjectId(owner_repo)},
-    ) catch |e| oom(e);
+
+fn allocRepoApiUrl(allocator: std.mem.Allocator, pkg: *const PkgGit, comptime suffix_fmt: []const u8, args: anytype) []u8 {
+    return std.fmt.allocPrint(allocator, "{f}" ++ suffix_fmt, .{fmtRepoApi(pkg)} ++ args) catch |e| oom(e);
+}
+
+fn allocUrlTarball(allocator: std.mem.Allocator, pkg: *const PkgGit, rev: []const u8) []u8 {
+    return switch (pkg.forge) {
+        .github => allocRepoApiUrl(allocator, pkg, "/tarball/{s}", .{rev}),
+        .gitlab => allocRepoApiUrl(allocator, pkg, "/repository/archive.tar.gz?sha={s}", .{rev}),
+        .forgejo => allocRepoApiUrl(allocator, pkg, "/archive/{s}.tar.gz", .{rev}),
+    };
+}
+
+fn getLatestRelease(scratch: *Scratch, http: Http, pkg: *const PkgGit) GitArchive {
+    log.info("fetching latest release for {f}...", .{pkg.*});
+    const release_url = switch (pkg.forge) {
+        .github, .forgejo => allocRepoApiUrl(scratch.allocator(), pkg, "/releases/latest", .{}),
+        .gitlab => allocRepoApiUrl(scratch.allocator(), pkg, "/releases/permalink/latest", .{}),
+    };
     defer scratch.allocator().free(release_url);
     var timer: Timer = .init(http.ctx.io);
     var fetch_result = fetchGitJson(release_url, http, scratch.allocator());
@@ -720,11 +570,12 @@ fn getLatestReleaseGitlab(scratch: *Scratch, http: Http, owner_repo: *const Owne
         log.info("fetched latest release JSON in {d:.2} seconds", .{elapsed});
         const release = blk_release: {
             var err: ParseJsonError = undefined;
-            break :blk_release parseReleaseGitlab(
-                fetch_result.body.items,
-                &err,
-            ) catch jsonErrorExit(scratch, http.ctx, release_url, fetch_result.body.items, &err);
+            break :blk_release switch (pkg.forge) {
+                .github, .forgejo => parseReleaseGithub(fetch_result.body.items, &err),
+                .gitlab => parseReleaseGitlab(fetch_result.body.items, &err),
+            } catch jsonErrorExit(scratch, http.ctx, release_url, fetch_result.body.items, &err);
         };
+        checkTagName(pkg, release.tag_name);
         log.info("latest release is tag {s}", .{release.tag_name});
         return .{ .rev = .{
             .json = fetch_result.body,
@@ -732,15 +583,21 @@ fn getLatestReleaseGitlab(scratch: *Scratch, http: Http, owner_repo: *const Owne
             .tarball_url = release.tarball_url,
         } };
     }
-
     {
-        // Only fall back to tags if the releases endpoint returned "Not Found".
-        // Other 404s (e.g. repo doesn't exist) should still be fatal.
+        // Only fall back to tags if the releases endpoint says there's no release.
+        // Other 404s (e.g. repo doesn't exist) should still be fatal. On forgejo a
+        // missing repo under an existing owner gets the same message, but then the
+        // tags request below fails with its own 404.
+        const no_release_message = switch (pkg.forge) {
+            .github => "Not Found",
+            .gitlab => "404 Not Found",
+            .forgejo => "The target couldn't be found.",
+        };
         const is_no_releases = fetch_result.status == .not_found and blk_msg: {
             var err: ParseJsonError = undefined;
             const msg = parseMessage(fetch_result.body.items, &err) catch
                 jsonErrorExit(scratch, http.ctx, release_url, fetch_result.body.items, &err);
-            break :blk_msg std.mem.eql(u8, msg, "404 Not Found");
+            break :blk_msg std.mem.eql(u8, msg, no_release_message);
         };
         if (!is_no_releases)
             fetchErrExit(release_url, fetch_result);
@@ -748,12 +605,12 @@ fn getLatestReleaseGitlab(scratch: *Scratch, http: Http, owner_repo: *const Owne
     fetch_result.body.deinit(scratch.allocator());
 
     // No releases found, fall back to latest tag.
-    log.info("no releases found, fetching latest tag for gitlab:{s}...", .{owner_repo.string});
-    const tags_url = std.fmt.allocPrint(
-        scratch.allocator(),
-        "https://gitlab.com/api/v4/projects/{f}/repository/tags?per_page=1",
-        .{fmtGitlabProjectId(owner_repo)},
-    ) catch |e| oom(e);
+    log.info("no releases found, fetching latest tag for {f}...", .{pkg.*});
+    const tags_url = switch (pkg.forge) {
+        .github => allocRepoApiUrl(scratch.allocator(), pkg, "/tags?per_page=1", .{}),
+        .gitlab => allocRepoApiUrl(scratch.allocator(), pkg, "/repository/tags?per_page=1", .{}),
+        .forgejo => allocRepoApiUrl(scratch.allocator(), pkg, "/tags?limit=1", .{}),
+    };
     defer scratch.allocator().free(tags_url);
     timer = .init(http.ctx.io);
     var tags_result = fetchGitJson(tags_url, http, scratch.allocator());
@@ -762,98 +619,42 @@ fn getLatestReleaseGitlab(scratch: *Scratch, http: Http, owner_repo: *const Owne
         fetchErrExit(tags_url, tags_result);
     const tags_elapsed = timer.seconds();
     log.info("fetched latest tag JSON in {d:.2} seconds", .{tags_elapsed});
-
     const tag_name = blk_tag: {
         var err: ParseJsonError = undefined;
-        break :blk_tag (parseLatestTagGitlab(tags_result.body.items, &err) catch |e| switch (e) {
+        break :blk_tag (parseLatestTag(tags_result.body.items, &err) catch |e| switch (e) {
             error.ParseJson => jsonErrorExit(scratch, http.ctx, tags_url, tags_result.body.items, &err),
         }) orelse {
-            log.info("no tags found either, falling back to tip for gitlab:{s}...", .{owner_repo.string});
+            log.info("no tags found either, falling back to tip for {f}...", .{pkg.*});
             tags_result.body.deinit(scratch.allocator());
-            const tip_archive = fetchTipGitlab(scratch, scratch.allocator(), owner_repo, http);
+            const tip_archive = fetchTip(scratch, scratch.allocator(), pkg, http);
             log.info("tip is commit {f}", .{&tip_archive.tip.sha});
             return tip_archive;
         };
     };
+    checkTagName(pkg, tag_name);
     log.info("latest tag is {s}", .{tag_name});
     return .{ .rev = .{
         .json = tags_result.body,
         .rev_name = tag_name,
-        .tarball_url = allocUrlGitlabTarball(scratch.allocator(), owner_repo, tag_name),
+        .tarball_url = allocUrlTarball(scratch.allocator(), pkg, tag_name),
     } };
 }
 
-fn fetchTipGithub(scratch: *Scratch, allocator: std.mem.Allocator, owner_repo: *const OwnerRepo, http: Http) GitArchive {
-    log.info("fetching tip commit for github:{s}...", .{owner_repo.string});
-    const commit_url = std.fmt.allocPrint(
-        scratch.allocator(),
-        "https://api.github.com/repos/{s}/commits/HEAD",
-        .{owner_repo.string},
-    ) catch |e| oom(e);
-    defer scratch.allocator().free(commit_url);
-    var timer: Timer = .init(http.ctx.io);
-    const commit_result = fetchGitJson(commit_url, http, allocator);
-    if (commit_result.status != .ok)
-        fetchErrExit(commit_url, commit_result);
-    const elapsed = timer.seconds();
-    log.info("fetched tip commit JSON in {d:.2} seconds", .{elapsed});
-    const sha = blk: {
-        var err: ParseJsonError = undefined;
-        break :blk parseCommitShaGithub(
-            commit_result.body.items,
-            &err,
-        ) catch jsonErrorExit(scratch, http.ctx, commit_url, commit_result.body.items, &err);
-    };
-    const sha_hex = sha.hex();
-    const tarball_url = allocUrlGithubTarball(allocator, owner_repo, &sha_hex);
-    errdefer allocator.free(tarball_url);
-    return .{ .tip = .{
-        .json = commit_result.body,
-        .sha = sha,
-        .tarball_url = tarball_url,
-    } };
+/// Exits if a tag name from the package's forge isn't safe to use in URLs and file names.
+fn checkTagName(pkg: *const PkgGit, tag_name: []const u8) void {
+    if (!isSafeRev(tag_name)) errExit(
+        "{f}: unsupported tag name \"{f}\", tag names may only contain letters, digits, '.', '_' and '-'",
+        .{ pkg.*, std.zig.fmtString(tag_name) },
+    );
 }
 
-fn fetchTipGitlab(scratch: *Scratch, allocator: std.mem.Allocator, owner_repo: *const OwnerRepo, http: Http) GitArchive {
-    log.info("fetching tip commit for gitlab:{s}...", .{owner_repo.string});
-    const commit_url = std.fmt.allocPrint(
-        scratch.allocator(),
-        "https://gitlab.com/api/v4/projects/{f}/repository/commits/HEAD",
-        .{fmtGitlabProjectId(owner_repo)},
-    ) catch |e| oom(e);
-    defer scratch.allocator().free(commit_url);
-    var timer: Timer = .init(http.ctx.io);
-    const commit_result = fetchGitJson(commit_url, http, allocator);
-    if (commit_result.status != .ok)
-        fetchErrExit(commit_url, commit_result);
-    const elapsed = timer.seconds();
-    log.info("fetched tip commit JSON in {d:.2} seconds", .{elapsed});
-    const sha = blk: {
-        var err: ParseJsonError = undefined;
-        break :blk parseCommitShaGitlab(
-            commit_result.body.items,
-            &err,
-        ) catch jsonErrorExit(scratch, http.ctx, commit_url, commit_result.body.items, &err);
+fn fetchTip(scratch: *Scratch, allocator: std.mem.Allocator, pkg: *const PkgGit, http: Http) GitArchive {
+    log.info("fetching tip commit for {f}...", .{pkg.*});
+    const commit_url = switch (pkg.forge) {
+        .github => allocRepoApiUrl(scratch.allocator(), pkg, "/commits/HEAD", .{}),
+        .gitlab => allocRepoApiUrl(scratch.allocator(), pkg, "/repository/commits/HEAD", .{}),
+        .forgejo => allocRepoApiUrl(scratch.allocator(), pkg, "/git/commits/HEAD", .{}),
     };
-    const tarball_url = std.fmt.allocPrint(
-        allocator,
-        "https://gitlab.com/api/v4/projects/{f}/repository/archive.tar.gz?sha={f}",
-        .{ fmtGitlabProjectId(owner_repo), &sha },
-    ) catch |e| oom(e);
-    errdefer allocator.free(tarball_url);
-    return .{ .tip = .{
-        .json = commit_result.body,
-        .sha = sha,
-        .tarball_url = tarball_url,
-    } };
-}
-fn fetchTipCodeberg(scratch: *Scratch, allocator: std.mem.Allocator, owner_repo: *const OwnerRepo, http: Http) GitArchive {
-    log.info("fetching tip commit for codeberg:{s}...", .{owner_repo.string});
-    const commit_url = std.fmt.allocPrint(
-        scratch.allocator(),
-        "https://codeberg.org/api/v1/repos/{s}/git/commits/HEAD",
-        .{owner_repo.string},
-    ) catch |e| oom(e);
     defer scratch.allocator().free(commit_url);
     var timer: Timer = .init(http.ctx.io);
     const commit_result = fetchGitJson(commit_url, http, allocator);
@@ -863,13 +664,13 @@ fn fetchTipCodeberg(scratch: *Scratch, allocator: std.mem.Allocator, owner_repo:
     log.info("fetched tip commit JSON in {d:.2} seconds", .{elapsed});
     const sha = blk: {
         var err: ParseJsonError = undefined;
-        break :blk parseCommitShaCodeberg(
-            commit_result.body.items,
-            &err,
-        ) catch jsonErrorExit(scratch, http.ctx, commit_url, commit_result.body.items, &err);
+        break :blk parseSha(commit_result.body.items, &err, switch (pkg.forge) {
+            .github, .forgejo => "sha",
+            .gitlab => "id",
+        }) catch jsonErrorExit(scratch, http.ctx, commit_url, commit_result.body.items, &err);
     };
     const sha_hex = sha.hex();
-    const tarball_url = allocUrlCodebergTarball(allocator, owner_repo, &sha_hex);
+    const tarball_url = allocUrlTarball(allocator, pkg, &sha_hex);
     errdefer allocator.free(tarball_url);
     return .{ .tip = .{
         .json = commit_result.body,
@@ -886,48 +687,21 @@ fn installPkgGit(scratch: *Scratch, config: *const InstallConfig, pkg: PkgGit) !
     defer client.deinit();
     const http: Http = .{ .ctx = config.ctx, .client = &client, .git_auth = config.git_auth };
 
-    var archive: GitArchive = blk: switch (pkg.commit) {
-        .latest_release => switch (pkg.host) {
-            .github => getLatestReleaseGithub(scratch, http, &pkg.owner_repo),
-            .gitlab => getLatestReleaseGitlab(scratch, http, &pkg.owner_repo),
-            .codeberg => getLatestReleaseCodeberg(scratch, http, &pkg.owner_repo),
-        },
-        .rev => |rev| break :blk .{ .rev = .{
+    var archive: GitArchive = switch (pkg.commit) {
+        .latest_release => getLatestRelease(scratch, http, &pkg),
+        .rev => |rev| .{ .rev = .{
             .json = .empty,
             .rev_name = rev,
-            .tarball_url = switch (pkg.host) {
-                .github => allocUrlGithubTarball(scratch.allocator(), &pkg.owner_repo, rev),
-                .gitlab => allocUrlGitlabTarball(scratch.allocator(), &pkg.owner_repo, rev),
-                .codeberg => allocUrlCodebergTarball(scratch.allocator(), &pkg.owner_repo, rev),
-            },
+            .tarball_url = allocUrlTarball(scratch.allocator(), &pkg, rev),
         } },
-        .tip => break :blk switch (pkg.host) {
-            .github => fetchTipGithub(
-                scratch,
-                scratch.allocator(),
-                &pkg.owner_repo,
-                http,
-            ),
-            .gitlab => fetchTipGitlab(
-                scratch,
-                scratch.allocator(),
-                &pkg.owner_repo,
-                http,
-            ),
-            .codeberg => fetchTipCodeberg(
-                scratch,
-                scratch.allocator(),
-                &pkg.owner_repo,
-                http,
-            ),
-        },
+        .tip => fetchTip(scratch, scratch.allocator(), &pkg, http),
     };
     defer archive.deinit(scratch.allocator());
 
     const manifest_path = std.fmt.allocPrint(
         scratch.allocator(),
-        "{s}{c}manifests{1c}{t}-{s}-{s}-{f}",
-        .{ config.app_data_path, std.fs.path.sep, pkg.host, pkg.owner(), pkg.repo(), archive.fmtUniqueName() },
+        "{s}{c}manifests{1c}{f}+{f}",
+        .{ config.app_data_path, std.fs.path.sep, pkg.fmtFileName(), archive.fmtUniqueName() },
     ) catch |e| oom(e);
     defer scratch.allocator().free(manifest_path);
     if (std.Io.Dir.cwd().readFileAlloc(io, manifest_path, scratch.allocator(), .unlimited)) |manifest| {
@@ -953,8 +727,8 @@ fn installPkgGit(scratch: *Scratch, config: *const InstallConfig, pkg: PkgGit) !
 
     const pkg_cache_path = std.fmt.allocPrint(
         scratch.allocator(),
-        "{s}{c}{t}-{s}-{s}-{f}.tar.gz",
-        .{ config.cache_path, std.fs.path.sep, pkg.host, pkg.owner(), pkg.repo(), archive.fmtUniqueName() },
+        "{s}{c}{f}+{f}.tar.gz",
+        .{ config.cache_path, std.fs.path.sep, pkg.fmtFileName(), archive.fmtUniqueName() },
     ) catch |e| oom(e);
     defer scratch.free(pkg_cache_path);
 
@@ -963,8 +737,8 @@ fn installPkgGit(scratch: *Scratch, config: *const InstallConfig, pkg: PkgGit) !
     const extract_dir_path = allocTmpPath(
         scratch.allocator(),
         config.ctx.tmp_dir,
-        "hew-{t}-{s}-{s}-{f}",
-        .{ pkg.host, pkg.owner(), pkg.repo(), archive.fmtUniqueName() },
+        "hew-{f}+{f}",
+        .{ pkg.fmtFileName(), archive.fmtUniqueName() },
     );
     defer scratch.free(extract_dir_path);
 
@@ -1710,19 +1484,48 @@ const bearer_prefix = "Bearer ";
 const max_auth_token_len = 512;
 const github_auth_buf_len = bearer_prefix.len + max_auth_token_len;
 
-fn gitHostFromUrl(url: []const u8) ?GitHost {
+/// The hosts hew sends API tokens to (see token_env_names). Tokens go only to
+/// these exact hosts, never to a custom host, whatever its kind.
+const TokenHost = enum { github, gitlab, codeberg };
+
+/// Returns which host's token to send to `url`, if any: only https URLs to the exact
+/// hosts hew uses for github.com, gitlab.com and codeberg.org (not their subdomains,
+/// which can be run by anyone).
+fn tokenHostFromUrl(url: []const u8) ?TokenHost {
     const uri = std.Uri.parse(url) catch return null;
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return null;
+    if (uri.user != null or uri.password != null) return null;
     const host = (uri.host orelse return null).percent_encoded;
-    if (std.mem.eql(u8, host, "github.com") or
-        std.mem.endsWith(u8, host, ".github.com")) return .github;
-    if (std.mem.eql(u8, host, "gitlab.com") or
-        std.mem.endsWith(u8, host, ".gitlab.com")) return .gitlab;
-    if (std.mem.eql(u8, host, "codeberg.org")) return .codeberg;
+    for ([_]struct { []const u8, TokenHost }{
+        .{ "github.com", .github },
+        .{ "api.github.com", .github },
+        .{ "gitlab.com", .gitlab },
+        .{ "codeberg.org", .codeberg },
+    }) |entry| {
+        if (std.ascii.eqlIgnoreCase(host, entry[0])) return entry[1];
+    }
     return null;
 }
 
+test tokenHostFromUrl {
+    try std.testing.expectEqual(TokenHost.github, tokenHostFromUrl("https://api.github.com/repos/o/r/tarball/v1").?);
+    try std.testing.expectEqual(TokenHost.github, tokenHostFromUrl("https://github.com/o/r/releases/download/v1/x.zip").?);
+    try std.testing.expectEqual(TokenHost.gitlab, tokenHostFromUrl("https://gitlab.com/api/v4/projects/a%2Fb").?);
+    try std.testing.expectEqual(TokenHost.codeberg, tokenHostFromUrl("https://codeberg.org/api/v1/repos/o/r").?);
+    // not https
+    try std.testing.expectEqual(null, tokenHostFromUrl("http://api.github.com/repos/o/r/tarball/v1"));
+    // subdomains anyone could run
+    try std.testing.expectEqual(null, tokenHostFromUrl("https://forum.gitlab.com/api/v1/repos/o/r"));
+    try std.testing.expectEqual(null, tokenHostFromUrl("https://shop.github.com/api/v3/repos/o/r"));
+    // look-alikes and userinfo
+    try std.testing.expectEqual(null, tokenHostFromUrl("https://evilgithub.com/o/r"));
+    try std.testing.expectEqual(null, tokenHostFromUrl("https://github.com.evil.com/o/r"));
+    try std.testing.expectEqual(null, tokenHostFromUrl("https://github.com@evil.com/o/r"));
+    try std.testing.expectEqual(null, tokenHostFromUrl("https://user@github.com/o/r"));
+}
+
 /// The environment variables that hold each git host's API token, in priority order.
-const token_env_names: std.enums.EnumArray(GitHost, [2][]const u8) = .init(.{
+const token_env_names: std.enums.EnumArray(TokenHost, [2][]const u8) = .init(.{
     .github = .{ "GH_TOKEN", "GITHUB_TOKEN" },
     .gitlab = .{ "GITLAB_TOKEN", "GL_TOKEN" },
     .codeberg = .{ "CB_TOKEN", "CODEBERG_TOKEN" },
@@ -1735,10 +1538,10 @@ const token_env_names: std.enums.EnumArray(GitHost, [2][]const u8) = .init(.{
 const GitAuth = struct {
     tokens: switch (builtin.os.tag) {
         .windows => void,
-        else => std.enums.EnumArray(GitHost, ?Token),
+        else => std.enums.EnumArray(TokenHost, ?Token),
     },
     /// Hosts whose token source has been logged.
-    logged: std.enums.EnumSet(GitHost) = .empty,
+    logged: std.enums.EnumSet(TokenHost) = .empty,
 
     const Token = struct {
         env_name: []const u8,
@@ -1747,8 +1550,8 @@ const GitAuth = struct {
 
     pub fn init(environ: std.process.Environ) GitAuth {
         if (builtin.os.tag == .windows) return .{ .tokens = {} };
-        var tokens: std.enums.EnumArray(GitHost, ?Token) = .initFill(null);
-        for (std.enums.values(GitHost)) |host| {
+        var tokens: std.enums.EnumArray(TokenHost, ?Token) = .initFill(null);
+        for (std.enums.values(TokenHost)) |host| {
             for (token_env_names.get(host)) |env_name| {
                 if (environ.getPosix(env_name)) |value| {
                     tokens.set(host, .{ .env_name = env_name, .value = value });
@@ -1761,7 +1564,7 @@ const GitAuth = struct {
 
     /// Copies the token for `host` into `buf` (as WTF-8 on windows). Returns the
     /// name of the variable it came from and its length, or null if none are set.
-    fn read(auth: *const GitAuth, host: GitHost, buf: []u8) ?struct { []const u8, usize } {
+    fn read(auth: *const GitAuth, host: TokenHost, buf: []u8) ?struct { []const u8, usize } {
         if (builtin.os.tag == .windows) {
             const environ: std.process.Environ = .{ .block = .global };
             switch (host) {
@@ -1783,7 +1586,7 @@ const GitAuth = struct {
 };
 
 fn gitAuthHeader(git_auth: *GitAuth, buf: *[github_auth_buf_len]u8, url: []const u8) std.http.Client.Request.Headers.Value {
-    const host = gitHostFromUrl(url) orelse return .default;
+    const host = tokenHostFromUrl(url) orelse return .default;
     const env_name, const token_len = git_auth.read(host, buf[bearer_prefix.len..]) orelse .{ "none", 0 };
     if (!git_auth.logged.contains(host)) {
         git_auth.logged.insert(host);
@@ -2088,7 +1891,7 @@ fn scanJsonValue(err: *ParseJsonError, text: []const u8, start: usize) error{Par
 
 /// Parse the "name" field from the first element of a JSON array: [{"name":"tag",...},...]
 /// Returns null if the array is empty (there are no tags).
-fn parseLatestTagGithub(text: []const u8, err: *ParseJsonError) error{ParseJson}!?[]const u8 {
+fn parseLatestTag(text: []const u8, err: *ParseJsonError) error{ParseJson}!?[]const u8 {
     var index = try parseJsonArrayStart(err, text, 0);
     if (parseJsonArrayEndFirst(text, &index)) return null;
 
@@ -2106,9 +1909,6 @@ fn parseLatestTagGithub(text: []const u8, err: *ParseJsonError) error{ParseJson}
     return err.set(object_start_token.start, .{ .missing_field = "name" });
 }
 
-// at least for now, we can use the same logic to extract the tag name as github
-const parseLatestTagGitlab = parseLatestTagGithub;
-const parseLatestTagCodeberg = parseLatestTagGithub;
 
 fn parseReleaseGithub(text: []const u8, err: *ParseJsonError) error{ParseJson}!Release {
     var index = try parseJsonObjectStart(err, text, 0);
@@ -2181,15 +1981,7 @@ fn parseReleaseGitlab(text: []const u8, err: *ParseJsonError) error{ParseJson}!R
     };
 }
 
-const parseReleaseCodeberg = parseReleaseGithub;
 
-fn parseCommitShaGithub(text: []const u8, err: *ParseJsonError) error{ParseJson}!GitSha {
-    return parseSha(text, err, "sha");
-}
-fn parseCommitShaGitlab(text: []const u8, err: *ParseJsonError) error{ParseJson}!GitSha {
-    return parseSha(text, err, "id");
-}
-const parseCommitShaCodeberg = parseCommitShaGithub;
 
 fn parseSha(text: []const u8, err: *ParseJsonError, field_name: [:0]const u8) error{ParseJson}!GitSha {
     var index = try parseJsonObjectStart(err, text, 0);
@@ -2880,6 +2672,7 @@ fn oom(e: error{OutOfMemory}) noreturn {
 
 comptime {
     _ = @import("pathenv.zig");
+    _ = @import("pkg.zig");
 }
 
 const log = std.log.scoped(.hew);
@@ -2901,8 +2694,7 @@ const which = @import("which.zig");
 const wintrace = @import("wintrace");
 const GitSha = @import("GitSha.zig");
 const LockFile = @import("LockFile.zig");
-const GitHost = @import("pkg.zig").GitHost;
 const Pkg = @import("pkg.zig").Pkg;
 const PkgGit = @import("pkg.zig").PkgGit;
-const OwnerRepo = @import("pkg.zig").OwnerRepo;
+const isSafeRev = @import("pkg.zig").isSafeRev;
 const Sha256 = std.crypto.hash.sha2.Sha256;

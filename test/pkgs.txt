@@ -1,34 +1,34 @@
 # TODO: enable macos once a hew release is built with zig 0.17, zig 0.15.2 and
 # older can't link against the Xcode SDK on the macos-latest runners
-github:hew-org/hew --disable-macos
-github:marler8997/zipcmdline,rev=v2026_10_11
-github:marler8997/msi,rev=268cd30219e07b9a3c729e4042406b74c4938028
-github:marler8997/anyzig,rev=v2026_11_12
-github:marler8997/msvcup,rev=v2026_11_19
+github.com/hew-org/hew --disable-macos
+github.com/marler8997/zipcmdline,rev=v2026_10_11
+github.com/marler8997/msi,rev=268cd30219e07b9a3c729e4042406b74c4938028
+github.com/marler8997/anyzig,rev=v2026_11_12
+github.com/marler8997/msvcup,rev=v2026_11_19
 # TODO: use a release
 # TODO: enable windows, mite (zig 0.15.2) fails to build when its path has an 8.3
 # short name, like the TEMP (C:\Users\RUNNER~1\...) on github's windows runners
-github:marler8997/mite,rev=b09297d9f877c8c610e5bb6bc572e6249b1742a1 --disable-macos --disable-windows
+github.com/marler8997/mite,rev=b09297d9f877c8c610e5bb6bc572e6249b1742a1 --disable-macos --disable-windows
 
 # TODO: enable macos once a flow release builds with zig 0.17 (v0.7.2 builds
-# with 0.15.2, see github:hew-org/hew above), flow's master fails on linux with
+# with 0.15.2, see github.com/hew-org/hew above), flow's master fails on linux with
 # -Werror from asio
-codeberg:neurocyte/flow,rev=v0.7.2 --disable-macos
+codeberg.org/neurocyte/flow,rev=v0.7.2 --disable-macos
 
 # codeberg: unpinned on purpose to test the "latest" lookups
 # latest release path (newest tag v0.3.0 has no release and fails to build)
-codeberg:marler/hew-test-release
+codeberg.org/marler/hew-test-release
 # tip path (no releases or tags)
-codeberg:marler/hew-test-commit
+codeberg.org/marler/hew-test-commit
 # latest tag path (tags but no releases)
-codeberg:marler/hew-test-tag
+codeberg.org/marler/hew-test-tag
 
 # commented out because v0.11.2 can't be built due to missing dependenty:
 #     git+https://github.com/hexops/xcode-frameworks.git#8a1cfb373587ea4c9bb1468b7c986462d8d4e10e
 #     github.com/hexops has moved to code.hexops.or
-# github:kristoff-it/zine,rev=v0.11.2 --disable-windows
+# github.com/kristoff-it/zine,rev=v0.11.2 --disable-windows
 
 # TODO: use a release, linux disabled because SDL has dependencies that may not be installed
 # I've commented this one out because there's an intermittent error "unrecognized 'Content-Type' header: 'text/html'"
 # that has happed on the CI from zig trying to fetch "https://thelettervsixtim.es/makeandplay/data.zip" from the zon file.
-# github:allyourcodebase/VVVVVV,rev=12b8d314b045b36e140c6bf33b73f06c94f94181 --disable-linux
+# github.com/allyourcodebase/VVVVVV,rev=12b8d314b045b36e140c6bf33b73f06c94f94181 --disable-linux
