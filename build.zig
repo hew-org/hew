@@ -276,6 +276,7 @@ fn makeCiArchiveStep(
         const zip = b.addRunArtifact(zip_exe);
         const out_zip_file = zip.addOutputFileArg(zip_name);
         zip.addArg("hew.exe");
+        zip.addArg("hew.pdb");
         zip.cwd = target_install_path;
         zip.step.dependOn(install_exes);
         return &b.addInstallFile(out_zip_file, zip_name).step;
