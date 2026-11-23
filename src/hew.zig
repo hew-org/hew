@@ -539,6 +539,8 @@ const FmtRepoApi = struct {
                 }
             },
             .forgejo => try w.print("https://{s}/api/v1/repos/{s}", .{ pkg.host, pkg.path }),
+            // sourcehut's API needs a token, its lookups use the repo's web root
+            .srht => try w.print("https://{s}/{s}", .{ pkg.host, pkg.path }),
         }
     }
 };
@@ -551,7 +553,7 @@ fn allocUrlTarball(allocator: std.mem.Allocator, pkg: *const PkgGit, rev: []cons
     return switch (pkg.forge) {
         .github => allocRepoApiUrl(allocator, pkg, "/tarball/{s}", .{rev}),
         .gitlab => allocRepoApiUrl(allocator, pkg, "/repository/archive.tar.gz?sha={s}", .{rev}),
-        .forgejo => allocRepoApiUrl(allocator, pkg, "/archive/{s}.tar.gz", .{rev}),
+        .forgejo, .srht => allocRepoApiUrl(allocator, pkg, "/archive/{s}.tar.gz", .{rev}),
     };
 }
 
@@ -560,6 +562,7 @@ fn getLatestRelease(scratch: *Scratch, http: Http, pkg: *const PkgGit) GitArchiv
     const release_url = switch (pkg.forge) {
         .github, .forgejo => allocRepoApiUrl(scratch.allocator(), pkg, "/releases/latest", .{}),
         .gitlab => allocRepoApiUrl(scratch.allocator(), pkg, "/releases/permalink/latest", .{}),
+        .srht => unreachable, // getLatestTagSrht
     };
     defer scratch.allocator().free(release_url);
     var timer: Timer = .init(http.ctx.io);
@@ -573,6 +576,7 @@ fn getLatestRelease(scratch: *Scratch, http: Http, pkg: *const PkgGit) GitArchiv
             break :blk_release switch (pkg.forge) {
                 .github, .forgejo => parseReleaseGithub(fetch_result.body.items, &err),
                 .gitlab => parseReleaseGitlab(fetch_result.body.items, &err),
+                .srht => unreachable,
             } catch jsonErrorExit(scratch, http.ctx, release_url, fetch_result.body.items, &err);
         };
         checkTagName(pkg, release.tag_name);
@@ -592,6 +596,7 @@ fn getLatestRelease(scratch: *Scratch, http: Http, pkg: *const PkgGit) GitArchiv
             .github => "Not Found",
             .gitlab => "404 Not Found",
             .forgejo => "The target couldn't be found.",
+            .srht => unreachable,
         };
         const is_no_releases = fetch_result.status == .not_found and blk_msg: {
             var err: ParseJsonError = undefined;
@@ -610,6 +615,7 @@ fn getLatestRelease(scratch: *Scratch, http: Http, pkg: *const PkgGit) GitArchiv
         .github => allocRepoApiUrl(scratch.allocator(), pkg, "/tags?per_page=1", .{}),
         .gitlab => allocRepoApiUrl(scratch.allocator(), pkg, "/repository/tags?per_page=1", .{}),
         .forgejo => allocRepoApiUrl(scratch.allocator(), pkg, "/tags?limit=1", .{}),
+        .srht => unreachable,
     };
     defer scratch.allocator().free(tags_url);
     timer = .init(http.ctx.io);
@@ -654,6 +660,7 @@ fn fetchTip(scratch: *Scratch, allocator: std.mem.Allocator, pkg: *const PkgGit,
         .github => allocRepoApiUrl(scratch.allocator(), pkg, "/commits/HEAD", .{}),
         .gitlab => allocRepoApiUrl(scratch.allocator(), pkg, "/repository/commits/HEAD", .{}),
         .forgejo => allocRepoApiUrl(scratch.allocator(), pkg, "/git/commits/HEAD", .{}),
+        .srht => unreachable, // fetchTipSrht
     };
     defer scratch.allocator().free(commit_url);
     var timer: Timer = .init(http.ctx.io);
@@ -667,6 +674,7 @@ fn fetchTip(scratch: *Scratch, allocator: std.mem.Allocator, pkg: *const PkgGit,
         break :blk parseSha(commit_result.body.items, &err, switch (pkg.forge) {
             .github, .forgejo => "sha",
             .gitlab => "id",
+            .srht => unreachable,
         }) catch jsonErrorExit(scratch, http.ctx, commit_url, commit_result.body.items, &err);
     };
     const sha_hex = sha.hex();
@@ -679,6 +687,130 @@ fn fetchTip(scratch: *Scratch, allocator: std.mem.Allocator, pkg: *const PkgGit,
     } };
 }
 
+/// Finds the latest version of a sourcehut package, which has no releases: the
+/// newest tag from the repo's refs feed, otherwise its tip.
+fn getLatestTagSrht(scratch: *Scratch, http: Http, pkg: *const PkgGit) GitArchive {
+    log.info("fetching latest tag for {f}...", .{pkg.*});
+    const refs_url = allocRepoApiUrl(scratch.allocator(), pkg, "/refs/rss.xml", .{});
+    defer scratch.allocator().free(refs_url);
+    const timer: Timer = .init(http.ctx.io);
+    var refs_result = fetchGitJson(refs_url, http, scratch.allocator());
+    errdefer refs_result.body.deinit(scratch.allocator());
+    if (refs_result.status != .ok)
+        fetchErrExit(refs_url, refs_result);
+    log.info("fetched refs feed in {d:.2} seconds", .{timer.seconds()});
+    const tag_name = (parseLatestTagSrht(refs_result.body.items) catch |err| errExit(
+        "parse refs feed from '{s}' failed with {t}",
+        .{ refs_url, err },
+    )) orelse {
+        log.info("no tags found, falling back to tip for {f}...", .{pkg.*});
+        refs_result.body.deinit(scratch.allocator());
+        const tip_archive = fetchTipSrht(scratch, scratch.allocator(), pkg, http);
+        log.info("tip is commit {f}", .{&tip_archive.tip.sha});
+        return tip_archive;
+    };
+    checkTagName(pkg, tag_name);
+    log.info("latest tag is {s}", .{tag_name});
+    return .{ .rev = .{
+        .json = refs_result.body,
+        .rev_name = tag_name,
+        .tarball_url = allocUrlTarball(scratch.allocator(), pkg, tag_name),
+    } };
+}
+
+/// Returns the first tag in a sourcehut refs feed (newest first), the title of its
+/// first item, or null if it has no items.
+fn parseLatestTagSrht(rss: []const u8) error{MalformedRefsFeed}!?[]const u8 {
+    const item_start = std.mem.indexOf(u8, rss, "<item>") orelse return null;
+    const title_open = "<title>";
+    const title_start = (std.mem.indexOfPos(u8, rss, item_start, title_open) orelse
+        return error.MalformedRefsFeed) + title_open.len;
+    const title_end = std.mem.indexOfPos(u8, rss, title_start, "</title>") orelse
+        return error.MalformedRefsFeed;
+    return rss[title_start..title_end];
+}
+
+test parseLatestTagSrht {
+    try std.testing.expectEqualStrings("v0.2.0", (try parseLatestTagSrht(
+        "<rss version=\"2.0\"><channel><title>~u/r refs</title><item><title>v0.2.0</title>" ++
+            "<description /></item><item><title>v0.1.8</title></item></channel></rss>",
+    )).?);
+    try std.testing.expectEqual(null, try parseLatestTagSrht("<rss><channel><title>~u/r refs</title></channel></rss>"));
+    try std.testing.expectError(error.MalformedRefsFeed, parseLatestTagSrht("<rss><channel><item><description /></item>"));
+}
+
+/// Finds a sourcehut package's tip, its HEAD commit, from git's smart HTTP ref
+/// advertisement since sourcehut's API needs a token.
+fn fetchTipSrht(scratch: *Scratch, allocator: std.mem.Allocator, pkg: *const PkgGit, http: Http) GitArchive {
+    log.info("fetching tip commit for {f}...", .{pkg.*});
+    const refs_url = allocRepoApiUrl(scratch.allocator(), pkg, "/info/refs?service=git-upload-pack", .{});
+    defer scratch.allocator().free(refs_url);
+    const timer: Timer = .init(http.ctx.io);
+    const refs_result = fetchGitJson(refs_url, http, allocator);
+    if (refs_result.status != .ok)
+        fetchErrExit(refs_url, refs_result);
+    log.info("fetched refs in {d:.2} seconds", .{timer.seconds()});
+    const sha = (parseUploadPackHead(refs_result.body.items) catch |err| errExit(
+        "parse git refs from '{s}' failed with {t}",
+        .{ refs_url, err },
+    )) orelse errExit("{f} has no commits (no HEAD in '{s}')", .{ pkg.*, refs_url });
+    return .{ .tip = .{
+        .json = refs_result.body,
+        .sha = sha,
+        .tarball_url = allocUrlTarball(allocator, pkg, &sha.hex()),
+    } };
+}
+
+/// Returns HEAD's commit from a git-upload-pack ref advertisement (pkt-lines: the
+/// service line, a flush, then refs with HEAD first), or null for an empty repo.
+fn parseUploadPackHead(text: []const u8) error{MalformedGitRefs}!?GitSha {
+    var index: usize = 0;
+    const service = try nextPktLine(text, &index) orelse return error.MalformedGitRefs;
+    if (!std.mem.startsWith(u8, service, "# service=git-upload-pack")) return error.MalformedGitRefs;
+    if (try nextPktLine(text, &index) != null) return error.MalformedGitRefs; // expected a flush
+    // An empty repo has no refs, only the flush.
+    const first_ref = try nextPktLine(text, &index) orelse return null;
+    // "<sha> HEAD\x00<capabilities>"
+    if (first_ref.len < 40 + " HEAD".len) return error.MalformedGitRefs;
+    const name_end = std.mem.indexOfScalarPos(u8, first_ref, 41, 0) orelse
+        std.mem.indexOfScalarPos(u8, first_ref, 41, '\n') orelse first_ref.len;
+    if (first_ref[40] != ' ' or !std.mem.eql(u8, first_ref[41..name_end], "HEAD")) return null;
+    return GitSha.fromHex(first_ref[0..40]) orelse error.MalformedGitRefs;
+}
+
+/// Returns the next pkt-line's payload, or null for a flush packet ("0000").
+fn nextPktLine(text: []const u8, index: *usize) error{MalformedGitRefs}!?[]const u8 {
+    if (text.len - index.* < 4) return error.MalformedGitRefs;
+    const len = std.fmt.parseInt(u16, text[index.*..][0..4], 16) catch return error.MalformedGitRefs;
+    if (len == 0) {
+        index.* += 4;
+        return null;
+    }
+    if (len < 4 or len > text.len - index.*) return error.MalformedGitRefs;
+    const payload = text[index.* + 4 .. index.* + len];
+    index.* += len;
+    return payload;
+}
+
+/// A pkt-line: the payload prefixed with its length (including the prefix) in hex.
+fn testPkt(comptime payload: []const u8) []const u8 {
+    return comptime std.fmt.comptimePrint("{x:0>4}", .{payload.len + 4}) ++ payload;
+}
+
+test parseUploadPackHead {
+    const sha = "128ec0df11d2ed37477a4f6b8e9958b9feb6c09d";
+    const refs = comptime testPkt("# service=git-upload-pack\n") ++ "0000" ++
+        testPkt(sha ++ " HEAD\x00multi_ack thin-pack side-band-64k ofs-delta symref=HEAD:refs/heads/main\n") ++
+        testPkt(sha ++ " refs/heads/main\n") ++ "0000";
+    // the bytes git.sr.ht's response starts with
+    try std.testing.expect(std.mem.startsWith(u8, refs, "001e# service=git-upload-pack\n0000"));
+    try std.testing.expectEqualStrings(sha, &(try parseUploadPackHead(refs)).?.hex());
+    // an empty repo
+    try std.testing.expectEqual(null, try parseUploadPackHead("001e# service=git-upload-pack\n00000000"));
+    try std.testing.expectError(error.MalformedGitRefs, parseUploadPackHead("<html>not git</html>"));
+    try std.testing.expectError(error.MalformedGitRefs, parseUploadPackHead("001e# service=git-upload-pack\n00ff"));
+}
+
 fn installPkgGit(scratch: *Scratch, config: *const InstallConfig, pkg: PkgGit) !void {
     const scratch_pos = scratch.position();
     defer scratch.restorePosition(scratch_pos);
@@ -688,13 +820,19 @@ fn installPkgGit(scratch: *Scratch, config: *const InstallConfig, pkg: PkgGit) !
     const http: Http = .{ .ctx = config.ctx, .client = &client, .git_auth = config.git_auth };
 
     var archive: GitArchive = switch (pkg.commit) {
-        .latest_release => getLatestRelease(scratch, http, &pkg),
+        .latest_release => switch (pkg.forge) {
+            .github, .gitlab, .forgejo => getLatestRelease(scratch, http, &pkg),
+            .srht => getLatestTagSrht(scratch, http, &pkg),
+        },
         .rev => |rev| .{ .rev = .{
             .json = .empty,
             .rev_name = rev,
             .tarball_url = allocUrlTarball(scratch.allocator(), &pkg, rev),
         } },
-        .tip => fetchTip(scratch, scratch.allocator(), &pkg, http),
+        .tip => switch (pkg.forge) {
+            .github, .gitlab, .forgejo => fetchTip(scratch, scratch.allocator(), &pkg, http),
+            .srht => fetchTipSrht(scratch, scratch.allocator(), &pkg, http),
+        },
     };
     defer archive.deinit(scratch.allocator());
 

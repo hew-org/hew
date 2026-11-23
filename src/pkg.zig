@@ -30,7 +30,7 @@ pub const Pkg = union(enum) {
                     host, host[0..std.mem.indexOfScalar(u8, host, '.').?],
                 }),
                 .unknown_host => |host| try writer.print(
-                    "unknown host '{s}', add its forge as an option: ',github', ',gitlab' or ',forgejo'",
+                    "unknown host '{s}', add its forge as an option: ',github', ',gitlab', ',forgejo' or ',srht'",
                     .{host},
                 ),
                 .redundant_forge => |r| try writer.print("remove the redundant ',{t}', '{s}' is always {t}", .{ r.forge, r.host, r.forge }),
@@ -39,6 +39,7 @@ pub const Pkg = union(enum) {
                     b.reason, b.host, switch (b.forge) {
                         .github, .forgejo => "owner/repo",
                         .gitlab => "group[/subgroup...]/repo",
+                        .srht => "~owner/repo",
                     },
                 }),
                 .invalid_char => |i| try writer.print("invalid character {f} in {s} \"{f}\"", .{
@@ -72,9 +73,9 @@ pub const Pkg = union(enum) {
             } else true)
             return .{ .err = .{ .host_port = s[0 .. scheme_end + 1 + port.len] } };
 
-        for (known_hosts) |known| {
-            if (std.mem.eql(u8, scheme, known.host[0..std.mem.indexOfScalar(u8, known.host, '.').?]))
-                return .{ .err = .{ .host_scheme = known.host } };
+        for ([_][]const u8{ "github.com", "gitlab.com", "codeberg.org" }) |host| {
+            if (std.mem.eql(u8, scheme, host[0..std.mem.indexOfScalar(u8, host, '.').?]))
+                return .{ .err = .{ .host_scheme = host } };
         }
         if (std.mem.eql(u8, scheme, "path")) {
             if (value.len == 0) return .{ .err = .{ .msg = "path package must be in 'path:PATH' format" } };
@@ -133,17 +134,23 @@ pub const Pkg = union(enum) {
         };
         if (std.mem.indexOfAny(u8, path, "?#") != null) return badPath(host, forge, "unexpected query or fragment");
         if (std.mem.endsWith(u8, path, ".git")) return badPath(host, forge, "unexpected '.git' suffix");
-        for (path) |c| {
+        // sourcehut owners start with '~', which is the only place it's allowed
+        const check_start: usize = if (forge == .srht) blk: {
+            if (!std.mem.startsWith(u8, path, "~")) return badPath(host, forge, "missing '~' before the owner");
+            break :blk 1;
+        } else 0;
+        for (path[check_start..]) |c| {
             if (c != '/' and !isNameChar(c)) return .{ .err = .{ .invalid_char = .{ .what = "path", .value = path, .char = c } } };
         }
         var segment_count: usize = 0;
         var segment_it = std.mem.splitScalar(u8, path, '/');
         while (segment_it.next()) |segment| : (segment_count += 1) {
-            if (segment.len == 0) return badPath(host, forge, if (path.len == 0) "missing path" else "empty path segment");
+            if (segment.len == 0 or (forge == .srht and segment_count == 0 and segment.len == 1))
+                return badPath(host, forge, if (path.len == 0) "missing path" else "empty path segment");
             if (isDotName(segment)) return badPath(host, forge, "unexpected '.' or '..' path segment");
         }
         switch (forge) {
-            .github, .forgejo => if (segment_count != 2) return badPath(
+            .github, .forgejo, .srht => if (segment_count != 2) return badPath(
                 host,
                 forge,
                 if (segment_count < 2) "missing owner/repo" else "unexpected path after owner/repo",
@@ -181,6 +188,8 @@ pub const Forge = enum {
     gitlab,
     /// Forgejo and Gitea, which share an API
     forgejo,
+    /// sourcehut, which has no releases
+    srht,
 };
 
 /// Hosts whose forge is known, packages on other hosts specify it as an option.
@@ -188,6 +197,7 @@ pub const known_hosts = [_]struct { host: []const u8, forge: Forge }{
     .{ .host = "github.com", .forge = .github },
     .{ .host = "gitlab.com", .forge = .gitlab },
     .{ .host = "codeberg.org", .forge = .forgejo },
+    .{ .host = "git.sr.ht", .forge = .srht },
 };
 
 /// Hosts are limited to these characters. Uppercase is rejected so each host has
@@ -225,7 +235,7 @@ pub fn forgeOf(host: []const u8) ?Forge {
 pub const PkgGit = struct {
     host: []const u8,
     forge: Forge,
-    /// owner/repo, or group[/subgroup...]/repo for gitlab
+    /// owner/repo, group[/subgroup...]/repo for gitlab or ~owner/repo for sourcehut
     path: []const u8,
     commit: Commit,
 
@@ -305,6 +315,22 @@ test "known host packages" {
     try expectGit("github.com/marler8997/msi/,tip", "github.com", .github, "marler8997/msi", .tip);
 }
 
+test "sourcehut packages" {
+    try expectGit("git.sr.ht/~asibahi/3sl", "git.sr.ht", .srht, "~asibahi/3sl", .latest_release);
+    try expectGit("git.sr.ht/~asibahi/3sl/,rev=v0.2.0", "git.sr.ht", .srht, "~asibahi/3sl", .{ .rev = "v0.2.0" });
+    try expectGit("sr.example.com/~user/repo,srht", "sr.example.com", .srht, "~user/repo", .latest_release);
+    try expectFormat("git.sr.ht/~asibahi/3sl", "git.sr.ht/~asibahi/3sl", "git.sr.ht+~asibahi+3sl");
+    try expectErr("git.sr.ht/asibahi/3sl", "missing '~' before the owner, must be of the form 'git.sr.ht/~owner/repo[,options]'");
+    try expectErr("git.sr.ht/~/3sl", "empty path segment, must be of the form 'git.sr.ht/~owner/repo[,options]'");
+    try expectErr("git.sr.ht/~asibahi/~3sl", "invalid character '~' in path \"~asibahi/~3sl\"");
+    try expectErr("git.sr.ht/~asibahi", "missing owner/repo, must be of the form 'git.sr.ht/~owner/repo[,options]'");
+    try expectErr("git.sr.ht/~asibahi/3sl/tree", "unexpected path after owner/repo, must be of the form 'git.sr.ht/~owner/repo[,options]'");
+    try expectErr("github.com/~asibahi/3sl", "invalid character '~' in path \"~asibahi/3sl\"");
+    try expectErr("git.sr.ht/~asibahi/3sl,srht", "remove the redundant ',srht', 'git.sr.ht' is always srht");
+    // git: was never a scheme
+    try expectErr("git:asibahi/3sl", "unknown scheme 'git:'");
+}
+
 test "custom host packages" {
     try expectGit("git.example.com/team/tool,github", "git.example.com", .github, "team/tool", .latest_release);
     try expectGit("git.example.com/a/b/c,gitlab,tip", "git.example.com", .gitlab, "a/b/c", .tip);
@@ -361,7 +387,7 @@ test "bad packages" {
     try expectErr("https://github.com/marler8997/msi", "remove the 'https://' (or 'http://'), a package starts with its host, i.e. 'github.com/owner/repo'");
     try expectErr("http://github.com/marler8997/msi", "remove the 'https://' (or 'http://'), a package starts with its host, i.e. 'github.com/owner/repo'");
     try expectErr("msi", "expected a package of the form 'HOST/REPO_PATH', i.e. 'github.com/owner/repo'");
-    try expectErr("example.com/a/b", "unknown host 'example.com', add its forge as an option: ',github', ',gitlab' or ',forgejo'");
+    try expectErr("example.com/a/b", "unknown host 'example.com', add its forge as an option: ',github', ',gitlab', ',forgejo' or ',srht'");
     try expectErr("github.com/marler8997/msi,github", "remove the redundant ',github', 'github.com' is always github");
     try expectErr("github.com/marler8997/msi,gitlab", "the forge of 'github.com' is github, not gitlab");
     try expectErr("example.com/a/b,github,gitlab", "conflicting options 'github' and 'gitlab'");

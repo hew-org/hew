@@ -170,6 +170,8 @@ fn parsePkgsLine(pkgs_txt_path: []const u8, lineno: u32, line: []const u8) PkgsL
             if (builtin.os.tag == .macos) skip = true;
         } else if (std.mem.eql(u8, opt, "--disable-linux")) {
             if (builtin.os.tag == .linux) skip = true;
+        } else if (std.mem.eql(u8, opt, "--disable-windows-aarch64")) {
+            if (builtin.os.tag == .windows and builtin.cpu.arch == .aarch64) skip = true;
         } else {
             std.debug.panic("{s}:{d} unknown option '{s}'", .{ pkgs_txt_path, lineno, opt });
         }

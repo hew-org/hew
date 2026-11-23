@@ -15,6 +15,10 @@ github.com/marler8997/mite,rev=b09297d9f877c8c610e5bb6bc572e6249b1742a1 --disabl
 # -Werror from asio
 codeberg.org/neurocyte/flow,rev=v0.7.2 --disable-macos
 
+# zig 0.16.0 doesn't work on windows aarch64
+git.sr.ht/~asibahi/zift,rev=0.1.0 --disable-windows-aarch64
+git.sr.ht/~joshthesnom/mergant,rev=89ad4be408d60a9173ade02e9e679acd3427732e
+
 # codeberg: unpinned on purpose to test the "latest" lookups
 # latest release path (newest tag v0.3.0 has no release and fails to build)
 codeberg.org/marler/hew-test-release

@@ -25,11 +25,13 @@ PKG = HOST/REPO_PATH[,VERSION][,FORGE]
 HOST = github.com      # these hosts have a known FORGE
      | gitlab.com
      | codeberg.org
+     | git.sr.ht
      | (any other)     # requires FORGE
 
 FORGE = github         # github.com or GitHub Enterprise
       | gitlab
       | forgejo        # Forgejo or Gitea, i.e. codeberg.org
+      | srht           # sourcehut, i.e. git.sr.ht
 
 VERSION = (omitted)    # in this priority tries latest release, tag or commit on the default branch
         | rev=REVSPEC  # specific tag/commit
